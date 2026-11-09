@@ -17,6 +17,7 @@ import { Collector } from './collector/collector.js';
 import { WsDispatcher } from './dispatch/wsServer.js';
 import { WebhookDispatcher } from './dispatch/webhook.js';
 import { buildApi } from './api/server.js';
+import { ChatAssistant } from './ai/chatAssistant.js';
 
 const PORT = Number(process.env.DYHUB_PORT ?? 8757);
 const HOST = process.env.DYHUB_HOST ?? '0.0.0.0';
@@ -90,6 +91,7 @@ async function main() {
 
   // 3. 分发层
   const webhooks = new WebhookDispatcher(bus);
+  const aiAssistant = new ChatAssistant(bus, collector);
 
   // 4. 管理 API（WS 分发器复用 Fastify 的 HTTP server，先建 app 再绑 ws）
   let wsDispatcher: WsDispatcher | null = null;
@@ -99,6 +101,7 @@ async function main() {
     wsClientCount: () => wsDispatcher?.clientCount() ?? 0,
     webhookDispatcher: webhooks,
     startedAt,
+    aiAssistant,
   });
   wsDispatcher = new WsDispatcher(app.server, bus, collector);
 
@@ -114,6 +117,7 @@ async function main() {
     await collector.disconnectAll();
     wsDispatcher?.close();
     webhooks.close();
+    aiAssistant.close();
     await browser?.close();
     process.exit(0);
   };

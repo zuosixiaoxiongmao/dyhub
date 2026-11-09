@@ -6,7 +6,8 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import type { Server as HttpServer } from 'node:http';
+import type { IncomingMessage, Server as HttpServer } from 'node:http';
+import type { Duplex } from 'node:stream';
 import { EventBus } from '../pipeline/eventBus.js';
 import { eventMatches, type DanmakuEvent, type EventFilter } from '../types/events.js';
 import type { Collector, RoomInfo } from '../collector/collector.js';
@@ -17,11 +18,20 @@ export class WsDispatcher {
   private collector: Collector;
   private clients = new Map<WebSocket, EventFilter>();
   private busSub: number;
+  private httpServer: HttpServer;
+  // 同一个 HTTP server 上还有其它 WS 端点（AI 日志流），因此用 noServer 手动匹配路径，
+  // 避免 ws 对不匹配路径的 upgrade 请求回 400、打断别的端点。
+  private onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/ws') return;
+    this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit('connection', ws, req));
+  };
 
   constructor(httpServer: HttpServer, bus: EventBus, collector: Collector) {
     this.bus = bus;
     this.collector = collector;
-    this.wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+    this.httpServer = httpServer;
+    this.wss = new WebSocketServer({ noServer: true });
+    httpServer.on('upgrade', this.onUpgrade);
     this.wss.on('connection', (ws, req) => {
       const url = new URL(req.url ?? '/', 'http://localhost');
       const roomId = url.searchParams.get('roomId') ?? undefined;
@@ -94,6 +104,7 @@ export class WsDispatcher {
 
   close(): void {
     this.bus.unsubscribe(this.busSub);
+    this.httpServer.off('upgrade', this.onUpgrade);
     this.wss.close();
   }
 }

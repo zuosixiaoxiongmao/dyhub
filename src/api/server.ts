@@ -14,6 +14,8 @@ import * as loginWindow from '../collector/loginWindow.js';
 import { EventBus } from '../pipeline/eventBus.js';
 import { WebhookDispatcher } from '../dispatch/webhook.js';
 import { registerSseRoute } from '../dispatch/sseServer.js';
+import type { ChatAssistant } from '../ai/chatAssistant.js';
+import { WebSocketServer, WebSocket } from 'ws';
 
 /**
  * 房间号归一化：兼容全角数字（中文输入法）、直接粘贴的直播间 URL、
@@ -40,15 +42,45 @@ export interface ApiDeps {
   wsClientCount: () => number;
   webhookDispatcher: WebhookDispatcher;
   startedAt: number;
+  aiAssistant: ChatAssistant;
 }
 
 export function buildApi(deps: ApiDeps): FastifyInstance {
   const app = Fastify({ logger: false });
 
+  app.get('/api/ai-chat', async () => deps.aiAssistant.getConfig());
+  app.get('/api/ai-chat/logs', async () => ({ logs: deps.aiAssistant.getLogs() }));
+  app.put('/api/ai-chat', async (req, reply) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') return reply.code(400).send({ error: 'enabled 必须是布尔值' });
+    return { ok: true, config: deps.aiAssistant.update(body as any) };
+  });
+  app.get('/api/ai-chat/prompts', async () => ({ prompts: deps.aiAssistant.listPrompts() }));
+  app.put('/api/ai-chat/prompts/:name', async (req, reply) => {
+    const { name } = req.params as { name: string };
+    const { content } = (req.body ?? {}) as { content?: unknown };
+    if (typeof content !== 'string') return reply.code(400).send({ error: 'content 必须是字符串' });
+    try { return { ok: true, prompt: deps.aiAssistant.savePrompt(name, content) }; }
+    catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }); }
+  });
+
   // 控制台静态资源
   const uiDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'ui');
   app.register(fastifyStatic, { root: uiDir, prefix: '/', index: ['dashboard.html'] });
   app.get('/', (_req, reply) => reply.sendFile('dashboard.html'));
+
+  const aiLogWss = new WebSocketServer({ noServer: true });
+  app.server.on('upgrade', (request, socket, head) => {
+    if (new URL(request.url ?? '/', 'http://localhost').pathname !== '/api/ai-chat/log-stream') return;
+    aiLogWss.handleUpgrade(request, socket, head, (client) => aiLogWss.emit('connection', client, request));
+  });
+  aiLogWss.on('connection', (client: WebSocket) => {
+    const unsubscribe = deps.aiAssistant.onLog((log) => {
+      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(log));
+    });
+    client.on('close', unsubscribe);
+    for (const log of deps.aiAssistant.getLogs().slice().reverse()) client.send(JSON.stringify(log));
+  });
 
   // ---- 账号管理（多账号隔离，每个账号独立 cookie）----
   app.get('/api/accounts', async () => ({ accounts: accountStore.listAccountStatuses() }));

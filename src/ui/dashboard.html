@@ -33,7 +33,14 @@
   .view.active { display: flex; }
   .view-monitor { flex-direction: row; }
   .main { flex: 1; display: flex; min-height: 0; }
-  .side { width: 320px; min-height: 0; border-right: 1px solid var(--border); background: var(--card); padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+  .side { width: 320px; min-height: 0; border-right: 1px solid var(--border); background: var(--card); padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+  .monitor-content { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  .ai-log-panel { height: 190px; min-height: 130px; flex: 0 0 auto; border-top: 1px solid var(--border); background: #fff; display: flex; flex-direction: column; }
+  .ai-log-head { padding: 7px 12px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; }
+  .ai-log-body { min-height: 0; flex: 1; overflow: auto; padding: 6px 12px; font: 11px/1.5 'SF Mono', Consolas, monospace; }
+  .ai-log-row { display: grid; grid-template-columns: 68px 70px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px solid #f0f0ed; white-space: pre-wrap; word-break: break-word; }
+  .ai-log-row.sent .ai-log-status { color: #2d7a4c; } .ai-log-row.skipped .ai-log-status { color: #9b751f; } .ai-log-row.error .ai-log-status { color: #a33; } .ai-log-row.checking .ai-log-status { color: var(--accent-dark); }
+  .ai-log-status { font-weight: 600; }
   .side-divider { flex: 0 0 auto; height: 0; border: 0; border-top: 1px solid var(--border); margin: 0; }
   .panel-title { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
   .room-add { display: flex; gap: 8px; }
@@ -204,6 +211,19 @@
         <div style="font-size:10px;color:var(--muted);margin-top:4px;">多账号不能同时订阅同一直播间</div>
       </div>
       <div>
+      <div class="panel-title">AI 设置</div>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiEnabled" type="checkbox" />启用自动发言</label>
+        <input id="aiBaseUrl" placeholder="API 地址，如 https://api.openai.com/v1" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
+        <input id="aiModel" placeholder="模型名称，如 gpt-4o-mini" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
+        <input id="aiKey" type="password" placeholder="API Key（保存在本机）" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
+        <div style="display:flex;gap:6px;margin-bottom:6px;"><label style="font-size:11px;flex:1;">检查间隔（秒）<input id="aiInterval" type="number" min="1" max="3600" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label><label style="font-size:11px;flex:1;">读取弹幕条数<input id="aiCount" type="number" min="1" max="100" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label></div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px;">每个周期最多判断一次；周期内没有新弹幕则不调用 LLM。</div>
+        <div style="display:flex;gap:6px;margin-bottom:6px;"><select id="aiPromptFile" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;"></select><button id="aiNewPrompt" class="ghost" style="padding:5px 8px;">新建风格</button></div>
+        <textarea id="aiPrompt" rows="4" placeholder="提示词文件内容" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;resize:vertical;margin-bottom:6px;"></textarea>
+        <button id="aiSavePrompt" class="ghost" style="width:100%;margin-bottom:6px;">保存当前提示词文件</button>
+        <button id="aiSave" style="width:100%;">保存 AI 设置</button><div id="aiMsg" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
+      </div>
+      <div>
         <div class="panel-title">已连接房间</div>
         <div class="room-list" id="roomList"></div>
       </div>
@@ -228,8 +248,14 @@
         </div>
       </div>
     </aside>
-    <div class="feed" id="feed">
-      <div class="empty" id="empty">暂无事件。连接直播间后，实时弹幕将显示在这里。</div>
+    <div class="monitor-content">
+      <div class="feed" id="feed">
+        <div class="empty" id="empty">暂无事件。连接直播间后，实时弹幕将显示在这里。</div>
+      </div>
+      <section class="ai-log-panel">
+        <div class="ai-log-head"><span>AI 回复日志</span><span id="aiLogState" style="font-weight:400;color:var(--muted);">等待事件</span><button class="ghost" id="aiLogClear" style="margin-left:auto;padding:3px 8px;font-size:11px;">清空显示</button></div>
+        <div class="ai-log-body" id="aiLogBody"><div style="color:var(--muted);">暂无 AI 判断记录</div></div>
+      </section>
     </div>
   </div>
 </div>
@@ -692,6 +718,58 @@ curl -X POST http://${base}/api/webhooks \\
     } catch {}
   }
 
+  let aiPrompts = [];
+  async function loadPrompts(selected) {
+    const data = await (await fetch('/api/ai-chat/prompts')).json(); aiPrompts = data.prompts || [];
+    $('aiPromptFile').innerHTML = aiPrompts.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('');
+    if (!aiPrompts.length) return;
+    const name = aiPrompts.some(p => p.name === selected) ? selected : aiPrompts[0].name;
+    $('aiPromptFile').value = name; $('aiPrompt').value = aiPrompts.find(p => p.name === name).content;
+  }
+  async function loadAiConfig() {
+    try { const c = await (await fetch('/api/ai-chat')).json();
+      $('aiEnabled').checked = c.enabled; $('aiBaseUrl').value = c.baseUrl; $('aiModel').value = c.model;
+      $('aiKey').placeholder = c.apiKey ? '已保存 API Key；留空保持不变' : 'API Key（保存在本机）';
+      $('aiCount').value = c.count; $('aiInterval').value = c.intervalSec; await loadPrompts(c.promptFile);
+    } catch {}
+  }
+  const aiLogStatus = { checking: '判断中', skipped: '未回复', sent: '已回复', error: '错误' };
+  function appendAiLog(log) {
+    const body = $('aiLogBody'); const empty = body.querySelector('div[style]'); if (empty && body.children.length === 1) body.innerHTML = '';
+    const row = document.createElement('div'); row.className = `ai-log-row ${log.status}`;
+    const time = new Date(log.ts).toLocaleTimeString();
+    const detail = [log.roomId ? `房间 ${log.roomId}` : '', log.inputCount ? `${log.inputCount} 条新弹幕` : '', log.message || '', log.output ? `LLM：${log.output}` : ''].filter(Boolean).join(' · ');
+    row.innerHTML = `<span>${escapeHtml(time)}</span><span class="ai-log-status">${aiLogStatus[log.status] || log.status}</span><span>${escapeHtml(detail)}</span>`;
+    body.appendChild(row); while (body.children.length > 200) body.removeChild(body.firstChild); body.scrollTop = body.scrollHeight;
+    $('aiLogState').textContent = log.message || aiLogStatus[log.status] || '';
+  }
+  function connectAiLogs() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const stream = new WebSocket(`${proto}//${location.host}/api/ai-chat/log-stream`);
+    stream.onopen = () => { $('aiLogState').textContent = '实时日志已连接'; };
+    stream.onmessage = (ev) => { try { appendAiLog(JSON.parse(ev.data)); } catch {} };
+    stream.onclose = () => setTimeout(connectAiLogs, 3000);
+  }
+  $('aiLogClear').onclick = () => { $('aiLogBody').innerHTML = '<div style="color:var(--muted);">显示已清空；新日志会继续出现</div>'; };
+  $('aiPromptFile').onchange = () => { const p = aiPrompts.find(x => x.name === $('aiPromptFile').value); if (p) $('aiPrompt').value = p.content; };
+  $('aiNewPrompt').onclick = async () => {
+    const name = prompt('新提示词文件名（例如：活泼.txt）：'); if (!name) return;
+    const filename = name.toLowerCase().endsWith('.txt') ? name : `${name}.txt`;
+    const content = prompt('输入这个风格的系统提示词：'); if (!content) return;
+    const r = await fetch(`/api/ai-chat/prompts/${encodeURIComponent(filename)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+    const j = await r.json(); if (!r.ok) { alert(j.error || '保存失败'); return; }
+    await loadPrompts(filename); $('aiMsg').textContent = '提示词文件已创建；点“保存 AI 设置”启用该风格。';
+  };
+  $('aiSavePrompt').onclick = async () => {
+    const name = $('aiPromptFile').value; if (!name) return alert('请先新建提示词文件');
+    const r = await fetch(`/api/ai-chat/prompts/${encodeURIComponent(name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: $('aiPrompt').value }) });
+    const j = await r.json(); $('aiMsg').textContent = r.ok ? '提示词文件已保存。' : (j.error || '保存失败'); if (r.ok) await loadPrompts(name);
+  };
+  $('aiSave').onclick = async () => {
+    const r = await fetch('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), promptFile: $('aiPromptFile').value }) });
+    const j = await r.json(); $('aiMsg').textContent = r.ok ? '设置已保存；对所有运行中的直播间生效。' : (j.error || '保存失败'); $('aiKey').value = '';
+  };
+
   async function connect(roomId) {
     const rid = normalizeRoomId(roomId || $('roomInput').value);
     if (!rid) { alert('请输入有效的直播间房间号（纯数字，或直接粘贴直播间链接）'); return; }
@@ -966,6 +1044,8 @@ curl -X POST http://${base}/api/webhooks \\
     }
   }).catch(() => {});
   refreshAccounts();
+  loadAiConfig();
+  connectAiLogs();
 
   connectWS();
   refresh();

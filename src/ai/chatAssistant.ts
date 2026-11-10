@@ -36,7 +36,7 @@ export class ChatAssistant {
     if (!readdirSync(PROMPT_DIR).some((f) => f.endsWith('.txt'))) writeFileSync(join(PROMPT_DIR, defaults.promptFile), DEFAULT_PROMPT, 'utf8');
     this.config = { ...this.config, promptFile: this.safePromptName(legacy.promptFile) || defaults.promptFile };
     this.subscription = bus.subscribe({ type: 'chat' }, (ev) => {
-      if (ev.type !== 'chat' || !ev.data.content.trim()) return;
+      if (ev.type !== 'chat' || !ev.data.content.trim() || !this.config.enabled) return;
       const list = this.recent.get(ev.roomId) ?? [];
       list.push(ev); if (list.length > 100) list.shift(); this.recent.set(ev.roomId, list);
       const pending = this.pending.get(ev.roomId) ?? [];
@@ -75,7 +75,14 @@ export class ChatAssistant {
     c.promptFile = this.safePromptName(c.promptFile) || this.config.promptFile;
     if (!input.apiKey || input.apiKey === '••••••••') c.apiKey = this.config.apiKey;
     else c.apiKey = String(input.apiKey).trim();
-    this.config = c; save(c); return this.getConfig();
+    const wasEnabled = this.config.enabled;
+    this.config = c; save(c);
+    if (wasEnabled && !c.enabled) {
+      for (const timer of this.timers.values()) clearTimeout(timer);
+      this.timers.clear();
+      this.pending.clear();
+    }
+    return this.getConfig();
   }
   private schedule(roomId: string) {
     if (this.timers.has(roomId)) return;
@@ -90,7 +97,7 @@ export class ChatAssistant {
     const pending = this.pending.get(roomId) ?? [];
     this.pending.delete(roomId);
     if (!pending.length) return;
-    if (!c.enabled) { this.log({ roomId, status: 'skipped', inputCount: pending.length, message: '自动发言未启用' }); return; }
+    if (!c.enabled) return;
     if (!c.apiKey || !c.model) { this.log({ roomId, status: 'error', inputCount: pending.length, message: '请配置 API Key 和模型' }); return; }
     if (this.running.has(roomId)) { this.log({ roomId, status: 'skipped', inputCount: pending.length, message: '上一轮判断仍在进行' }); return; }
     const events = (this.recent.get(roomId) ?? []).slice(-c.count);

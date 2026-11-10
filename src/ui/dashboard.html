@@ -217,7 +217,7 @@
         <input id="aiModel" placeholder="模型名称，如 gpt-4o-mini" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiKey" type="password" placeholder="API Key（保存在本机）" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <div style="display:flex;gap:6px;margin-bottom:6px;"><label style="font-size:11px;flex:1;">检查间隔（秒）<input id="aiInterval" type="number" min="1" max="3600" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label><label style="font-size:11px;flex:1;">读取弹幕条数<input id="aiCount" type="number" min="1" max="100" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label></div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:6px;">每个周期最多判断一次；周期内没有新弹幕则不调用 LLM。</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px;">关闭时不会处理弹幕或产生 AI 日志；开启后按周期检查新弹幕。</div>
         <div style="display:flex;gap:6px;margin-bottom:6px;"><select id="aiPromptFile" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;"></select><button id="aiNewPrompt" class="ghost" style="padding:5px 8px;">新建风格</button></div>
         <textarea id="aiPrompt" rows="4" placeholder="提示词文件内容" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;resize:vertical;margin-bottom:6px;"></textarea>
         <button id="aiSavePrompt" class="ghost" style="width:100%;margin-bottom:6px;">保存当前提示词文件</button>
@@ -730,11 +730,14 @@ curl -X POST http://${base}/api/webhooks \\
     try { const c = await (await fetch('/api/ai-chat')).json();
       $('aiEnabled').checked = c.enabled; $('aiBaseUrl').value = c.baseUrl; $('aiModel').value = c.model;
       $('aiKey').placeholder = c.apiKey ? '已保存 API Key；留空保持不变' : 'API Key（保存在本机）';
-      $('aiCount').value = c.count; $('aiInterval').value = c.intervalSec; await loadPrompts(c.promptFile);
+      $('aiCount').value = c.count; $('aiInterval').value = c.intervalSec; await loadPrompts(c.promptFile); updateAiLogConnection();
     } catch {}
   }
   const aiLogStatus = { checking: '判断中', skipped: '未回复', sent: '已回复', error: '错误' };
+  const seenAiLogIds = new Set();
   function appendAiLog(log) {
+    if (seenAiLogIds.has(log.id)) return;
+    seenAiLogIds.add(log.id);
     const body = $('aiLogBody'); const empty = body.querySelector('div[style]'); if (empty && body.children.length === 1) body.innerHTML = '';
     const row = document.createElement('div'); row.className = `ai-log-row ${log.status}`;
     const time = new Date(log.ts).toLocaleTimeString();
@@ -743,12 +746,20 @@ curl -X POST http://${base}/api/webhooks \\
     body.appendChild(row); while (body.children.length > 200) body.removeChild(body.firstChild); body.scrollTop = body.scrollHeight;
     $('aiLogState').textContent = log.message || aiLogStatus[log.status] || '';
   }
+  let aiLogStream = null; let aiLogRetry = null;
   function connectAiLogs() {
+    if (!$('aiEnabled').checked) { $('aiLogState').textContent = '自动发言未启用'; return; }
+    if (aiLogStream && (aiLogStream.readyState === WebSocket.OPEN || aiLogStream.readyState === WebSocket.CONNECTING)) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const stream = new WebSocket(`${proto}//${location.host}/api/ai-chat/log-stream`);
+    aiLogStream = stream;
     stream.onopen = () => { $('aiLogState').textContent = '实时日志已连接'; };
     stream.onmessage = (ev) => { try { appendAiLog(JSON.parse(ev.data)); } catch {} };
-    stream.onclose = () => setTimeout(connectAiLogs, 3000);
+    stream.onclose = () => { if (aiLogStream === stream) aiLogStream = null; if ($('aiEnabled').checked) aiLogRetry = setTimeout(connectAiLogs, 3000); };
+  }
+  function updateAiLogConnection() {
+    if ($('aiEnabled').checked) connectAiLogs();
+    else { clearTimeout(aiLogRetry); aiLogRetry = null; if (aiLogStream) { const stream = aiLogStream; aiLogStream = null; stream.close(); } $('aiLogState').textContent = '自动发言未启用'; }
   }
   $('aiLogClear').onclick = () => { $('aiLogBody').innerHTML = '<div style="color:var(--muted);">显示已清空；新日志会继续出现</div>'; };
   $('aiPromptFile').onchange = () => { const p = aiPrompts.find(x => x.name === $('aiPromptFile').value); if (p) $('aiPrompt').value = p.content; };
@@ -767,7 +778,7 @@ curl -X POST http://${base}/api/webhooks \\
   };
   $('aiSave').onclick = async () => {
     const r = await fetch('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), promptFile: $('aiPromptFile').value }) });
-    const j = await r.json(); $('aiMsg').textContent = r.ok ? '设置已保存；对所有运行中的直播间生效。' : (j.error || '保存失败'); $('aiKey').value = '';
+    const j = await r.json(); $('aiMsg').textContent = r.ok ? '设置已保存；对所有运行中的直播间生效。' : (j.error || '保存失败'); $('aiKey').value = ''; if (r.ok) updateAiLogConnection();
   };
 
   async function connect(roomId) {
@@ -1045,7 +1056,6 @@ curl -X POST http://${base}/api/webhooks \\
   }).catch(() => {});
   refreshAccounts();
   loadAiConfig();
-  connectAiLogs();
 
   connectWS();
   refresh();

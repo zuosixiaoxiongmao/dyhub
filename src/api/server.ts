@@ -62,6 +62,12 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const body = (req.body ?? {}) as Record<string, unknown>;
     if (body.enabled !== undefined && typeof body.enabled !== 'boolean') return reply.code(400).send({ error: 'enabled 必须是布尔值' });
     if (body.knowledgeDir !== undefined && typeof body.knowledgeDir !== 'string') return reply.code(400).send({ error: 'knowledgeDir 必须是字符串' });
+    if (body.idleReplyEnabled !== undefined && typeof body.idleReplyEnabled !== 'boolean') return reply.code(400).send({ error: 'idleReplyEnabled 必须是布尔值' });
+    if (body.idleReplyIntervalSec !== undefined && typeof body.idleReplyIntervalSec !== 'number') return reply.code(400).send({ error: 'idleReplyIntervalSec 必须是数字' });
+    const idleMessages = body.idleReplyMessages;
+    if (idleMessages !== undefined && (!Array.isArray(idleMessages) || idleMessages.some((m) => typeof m !== 'string'))) {
+      return reply.code(400).send({ error: 'idleReplyMessages 必须是字符串数组' });
+    }
     try { return { ok: true, config: deps.aiAssistant.update(body as any) }; }
     catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }); }
   });

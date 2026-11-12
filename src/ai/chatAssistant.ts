@@ -43,13 +43,19 @@ export interface AiConfig {
   replyIntervalMs: number;
   /** 重复弹幕忽略窗口（秒），0 表示不忽略 */
   duplicateWindowSec: number;
+  /** 直播间长时间无弹幕时自动发预设话术（独立于 enabled，不调用模型） */
+  idleReplyEnabled: boolean;
+  /** 弹幕静默多少秒后发送定时回复 */
+  idleReplyIntervalSec: number;
+  /** 定时回复话术，按顺序轮换 */
+  idleReplyMessages: string[];
 }
 
 export interface AiLog {
   id: number;
   ts: number;
   roomId: string;
-  status: 'checking' | 'tool' | 'skipped' | 'sent' | 'error';
+  status: 'checking' | 'tool' | 'skipped' | 'sent' | 'error' | 'idle';
   inputCount?: number;
   output?: string;
   /** 这条回复对应的观众昵称（模型返回了 player_name 时） */
@@ -108,6 +114,12 @@ const DEFAULT_REPLY_INTERVAL_MS = (() => {
 /** 单轮最多回复多少个观众，防止模型输出过多条目刷屏 */
 const MAX_REPLIES_PER_ROUND = 10;
 
+/** 定时回复：静默检测周期；定时话术的条数与单条长度上限 */
+const IDLE_TICK_MS = 10_000;
+const MAX_IDLE_MESSAGES = 50;
+const MAX_IDLE_MESSAGE_CHARS = 200;
+const DEFAULT_IDLE_REPLY_MESSAGE = '欢迎来到直播间～有问题随时在弹幕里问，我看到会尽快回复。';
+
 const defaults: AiConfig = {
   enabled: false,
   count: 10,
@@ -123,6 +135,9 @@ const defaults: AiConfig = {
   replyMaxChars: 180,
   replyIntervalMs: DEFAULT_REPLY_INTERVAL_MS,
   duplicateWindowSec: 300,
+  idleReplyEnabled: false,
+  idleReplyIntervalSec: 300,
+  idleReplyMessages: [DEFAULT_IDLE_REPLY_MESSAGE],
 };
 
 /** Agent 固定工作流：人设可以换，职责与输出约束不随提示词文件漂移 */
@@ -156,6 +171,11 @@ export class ChatAssistant {
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** 各房间最近已处理的弹幕内容签名 → 过期时间，用于抑制重复弹幕 */
   private handledChats = new Map<string, Map<string, number>>();
+  /** 各房间最近一条非空弹幕的接收时间（毫秒），用于静默计时 */
+  private idleLastChatAt = new Map<string, number>();
+  /** 各房间下一条定时话术的序号 */
+  private idleCursor = new Map<string, number>();
+  private idleTimer: ReturnType<typeof setInterval> | null = null;
   private logs: AiLog[] = [];
   private nextLogId = 1;
   private listeners = new Set<(log: AiLog) => void>();
@@ -184,9 +204,18 @@ export class ChatAssistant {
     if (existsSync(defaultPromptPath) && readFileSync(defaultPromptPath, 'utf8').trim() === LEGACY_DEFAULT_PROMPT) {
       writeFileSync(defaultPromptPath, DEFAULT_PROMPT, 'utf8');
     }
-    this.config = { ...this.config, promptFile: this.safePromptName(legacy.promptFile) || defaults.promptFile };
+    this.config = {
+      ...this.config,
+      promptFile: this.safePromptName(legacy.promptFile) || defaults.promptFile,
+      idleReplyMessages: normalizeIdleMessages(this.config.idleReplyMessages),
+    };
     this.subscription = bus.subscribe({ type: 'chat' }, (ev) => {
-      if (ev.type !== 'chat' || !ev.data.content.trim() || !this.config.enabled) return;
+      if (ev.type !== 'chat') return;
+      const text = ev.data.content.trim();
+      // 静默计时独立于自动回复开关：贴纸弹幕 content 为空，不算“有人在说话”。
+      // 用接收时间而不是发送时间，避免机器时钟偏差让计时永远不满足。
+      if (text) this.idleLastChatAt.set(ev.roomId, Math.min(ev.receivedAt || ev.ts || Date.now(), Date.now()));
+      if (!text || !this.config.enabled) return;
       const list = this.recent.get(ev.roomId) ?? [];
       list.push(ev); if (list.length > 100) list.shift(); this.recent.set(ev.roomId, list);
       const pending = this.pending.get(ev.roomId) ?? [];
@@ -195,6 +224,7 @@ export class ChatAssistant {
       this.pending.set(ev.roomId, pending);
       this.schedule(ev.roomId);
     });
+    if (this.config.idleReplyEnabled) this.startIdleTicker();
   }
   getConfig() { return { ...this.config, apiKey: this.config.apiKey ? '••••••••' : '', knowledgeDirResolved: this.knowledgeDir }; }
   getLogs() { return this.logs.slice(-200).reverse(); }
@@ -224,6 +254,10 @@ export class ChatAssistant {
     c.replyMaxChars = Math.max(20, Math.min(500, Math.floor(Number(c.replyMaxChars) || 180)));
     c.replyIntervalMs = Math.max(0, Math.min(60_000, Math.floor(Number(c.replyIntervalMs) || 0)));
     c.duplicateWindowSec = Math.max(0, Math.min(3600, Math.floor(Number(c.duplicateWindowSec) || 0)));
+    c.idleReplyIntervalSec = Math.max(30, Math.min(86400, Math.floor(Number(c.idleReplyIntervalSec) || 300)));
+    c.idleReplyEnabled = input.idleReplyEnabled === undefined ? this.config.idleReplyEnabled : Boolean(input.idleReplyEnabled);
+    c.idleReplyMessages = normalizeIdleMessages(input.idleReplyMessages === undefined ? this.config.idleReplyMessages : input.idleReplyMessages);
+    if (c.idleReplyEnabled && !c.idleReplyMessages.length) throw new Error('启用定时回复时至少需要一条非空话术');
     c.knowledgeEnabled = input.knowledgeEnabled === undefined ? this.config.knowledgeEnabled : Boolean(input.knowledgeEnabled);
     c.suggestionEnabled = input.suggestionEnabled === undefined ? this.config.suggestionEnabled : Boolean(input.suggestionEnabled);
     c.knowledgeDir = String(c.knowledgeDir ?? '').trim() || defaults.knowledgeDir;
@@ -240,6 +274,7 @@ export class ChatAssistant {
       catch (e) { throw new Error(`无法使用知识库目录「${nextDir}」：${e instanceof Error ? e.message : String(e)}`); }
     }
     const wasEnabled = this.config.enabled;
+    const wasIdleEnabled = this.config.idleReplyEnabled;
     this.config = c;
     this.knowledge = nextKnowledge;
     this.knowledgeDir = nextDir;
@@ -249,6 +284,8 @@ export class ChatAssistant {
       this.timers.clear();
       this.pending.clear();
     }
+    if (!wasIdleEnabled && c.idleReplyEnabled) this.startIdleTicker();
+    else if (wasIdleEnabled && !c.idleReplyEnabled) this.stopIdleTicker();
     return this.getConfig();
   }
 
@@ -467,6 +504,69 @@ export class ChatAssistant {
       this.running.delete(roomId);
       // 发送期间进来的弹幕留在 pending 里，这里补排下一轮，避免丢消息
       if ((this.pending.get(roomId)?.length ?? 0) > 0) this.schedule(roomId);
+    }
+  }
+
+  // ---- 定时回复：直播间长时间无弹幕时轮换发送预设话术（不调用模型） ----
+
+  private startIdleTicker() {
+    if (this.idleTimer) return;
+    // 还没有静默记录的房间以“开启这一刻”为起点；已有记录的房间沿用最近一条弹幕时间，
+    // 这样启用后若房间其实已经安静很久，会尽快发一条，而不是再等一个完整周期。
+    const now = Date.now();
+    for (const room of this.collector.getRooms()) {
+      if (room.status === 'live' && !this.idleLastChatAt.has(room.roomId)) this.idleLastChatAt.set(room.roomId, now);
+    }
+    this.idleTimer = setInterval(() => void this.idleTick(), IDLE_TICK_MS);
+  }
+
+  private stopIdleTicker() {
+    if (!this.idleTimer) return;
+    clearInterval(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  private async idleTick() {
+    const c = this.config;
+    if (!c.idleReplyEnabled || !c.idleReplyMessages.length) return;
+    const now = Date.now();
+    const rooms = new Map(this.collector.getRooms().map((room) => [room.roomId, room]));
+    // 房间已删除 / 已停止：清理计时与轮换状态，避免长期运行后 Map 无限增长
+    for (const id of [...this.idleLastChatAt.keys()]) {
+      if (rooms.get(id)?.status !== 'live') {
+        this.idleLastChatAt.delete(id);
+        this.idleCursor.delete(id);
+      }
+    }
+    for (const room of rooms.values()) {
+      const roomId = room.roomId;
+      if (room.status !== 'live' || !this.collector.canSendChat(roomId)) continue;
+      const last = this.idleLastChatAt.get(roomId);
+      if (last === undefined) {
+        this.idleLastChatAt.set(roomId, now);
+        continue;
+      }
+      if (now - last < c.idleReplyIntervalSec * 1000) continue;
+      // AI 正在逐条回复时不要插话；它的发言会自然重置静默计时
+      if (this.running.has(roomId)) continue;
+
+      const index = (this.idleCursor.get(roomId) ?? 0) % c.idleReplyMessages.length;
+      const text = c.idleReplyMessages[index];
+      // 先重置计时：即使发送失败，也要等下一个完整静默周期再重试，避免每 10 秒刷一次
+      this.idleLastChatAt.set(roomId, now);
+      this.idleCursor.set(roomId, (index + 1) % c.idleReplyMessages.length);
+      try {
+        await this.collector.sendChat(roomId, text);
+        const minutes = Math.max(1, Math.round(c.idleReplyIntervalSec / 60));
+        this.log({
+          roomId, status: 'idle', output: text,
+          message: `直播间 ${minutes} 分钟无弹幕，发送定时回复（${index + 1}/${c.idleReplyMessages.length}）`,
+        });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        this.log({ roomId, status: 'error', output: text, message: `定时回复发送失败：${message}` });
+        console.error(`[dyhub] 定时回复发送失败 (${roomId}):`, message);
+      }
     }
   }
 
@@ -763,6 +863,7 @@ ${persona}
     this.bus.unsubscribe(this.subscription);
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    this.stopIdleTicker();
     this.listeners.clear();
   }
 }
@@ -947,6 +1048,22 @@ function normalizePlayerName(value: unknown): string {
     .replace(/^['"“”「」]+|['"“”「」]+$/g, '')
     .trim()
     .slice(0, 40);
+}
+
+/** 定时回复话术：去首尾空白、合并换行、丢空行、按归一化内容去重、限制条数与单条长度 */
+function normalizeIdleMessages(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input) {
+    const text = String(raw ?? '').replace(/\s*\n+\s*/g, ' ').trim().slice(0, MAX_IDLE_MESSAGE_CHARS);
+    const key = chatSignature(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= MAX_IDLE_MESSAGES) break;
+  }
+  return out;
 }
 
 /**

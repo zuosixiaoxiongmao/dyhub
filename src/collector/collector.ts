@@ -242,6 +242,12 @@ export class Collector {
     await s.sendChat!(text);
   }
 
+  /** 该房间当前能否发弹幕（已进入直播且内核支持）；不发请求，供定时任务预判 */
+  canSendChat(roomId: string): boolean {
+    const s = this.sessions.get(roomId);
+    return Boolean(s && s.status === 'live' && s.sendChat);
+  }
+
   /** 直播间正在播放的流地址，播放器还没请求时为 null */
   getStreamUrl(roomId: string): string | null {
     return this.liveSession(roomId, 'streamUrl', '获取直播流').streamUrl!();

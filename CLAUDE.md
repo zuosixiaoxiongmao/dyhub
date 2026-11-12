@@ -56,8 +56,8 @@ docker compose up -d --build   # 一键启动（内置 Chromium + 中文字体�
   - `chatAssistant.ts` — 按房间聚合弹幕，按 `intervalSec` 触发 Agent；先对问题句做知识库预检索并注入提示词，模型可在资料不足时调用 `search_knowledge` 补充；接口不支持 `tools` 时自动降级为“预检索资料 + 普通对话”。模型按观众输出 JSON（`{"1":{"player_name","content"}}`），`parseReplies()` 拆成多条回复，一个观众一条，相邻两条按 `replyIntervalMs`（默认 `DYHUB_AI_REPLY_INTERVAL_MS` = 3000ms）间隔发送；兼容数组 / 外壳 / 旧版纯文本。`filterDuplicateChats()` / `markHandledChats()` 用 `chatSignature()`（归一化后去空格标点）抑制重复弹幕：同批相同内容只处理一次，`duplicateWindowSec`（默认 300 秒，0 = 关闭）内已处理的相同内容直接跳过，不调用模型；同一玩家一轮最多一条，只有成功回复的玩家会被标记为已处理。正式发言与 F3 调试面板共用 `composeReply()`，调试走 `POST /api/ai-chat/test-reply`（多行输入每行 `昵称：内容` 为一条模拟弹幕）且不发送弹幕。运行日志经 `/api/ai-chat/log-stream` 实时推送。
   - `agent.ts` — 轻量 Agent 工作流：OpenAI 兼容 `tools` / `tool_calls` 循环，最多 `maxRounds` 轮，支持一次调用多个工具与轮数上限收敛。**新增工具只需实现 `AgentTool` 接口并注册**，不改循环。
   - `knowledgeBase.ts` — 文档知识库。读取配置目录（`AiConfig.knowledgeDir`，默认 `data/knowledge`，支持绝对/相对路径，可用 `DYHUB_KNOWLEDGE_DIR` 改默认值）下的 `*.md|*.txt`，按 Markdown 标题 / 段落切块（700 字、100 字重叠），用中文二元词 + BM25 简化算法本地检索。`KnowledgeRetriever` / `KnowledgeDocumentStore` 是替换为向量库或远程知识服务的扩展点。目录规则、文档写法与排障见 `docs/knowledge-guide.md`。
-  - `suggestionStore.ts` — 游戏改进建议库（`data/ai-suggestions.json`）。Agent 识别出弹幕里对游戏的具体改进建议时调用 `record_suggestion` 工具写入，按房间隔离，同房间 7 天内相同内容去重，最多保留 2000 条。控制台「游戏改进建议」面板与 `GET/DELETE /api/ai-chat/suggestions` 可查看 / 删除，`AiConfig.suggestionEnabled`（默认开启）控制是否注册该工具；调试面板的模拟弹幕不写入。
-- **`src/api/server.ts`** — Fastify 管理 API（控制面）。房间管理、Webhook 管理、统计、SSE 路由注册、AI 配置 / 知识库 / 改进建议 CRUD、控制台静态资源。`normalizeRoomIdInput` 兼容全角数字 / 直播间 URL / 噪声输入。
+  - `suggestionStore.ts` — 游戏改进建议 / BUG 库（`data/ai-suggestions.json`）。Agent 识别出弹幕里对游戏的具体改进建议或 BUG 反馈（报错、卡顿、闪退等）时调用 `record_suggestion` 工具写入，按房间隔离，同房间 7 天内相同内容去重，最多保留 2000 条。控制台「游戏改进建议 / BUG」面板与 `GET/DELETE /api/ai-chat/suggestions` 可查看 / 删除，`AiConfig.suggestionEnabled`（默认开启）控制是否注册该工具；调试面板的模拟弹幕不写入。
+- **`src/api/server.ts`** — Fastify 管理 API（控制面）。房间管理、Webhook 管理、统计、SSE 路由注册、AI 配置 / 知识库 / 改进建议与 BUG CRUD、控制台静态资源。`normalizeRoomIdInput` 兼容全角数字 / 直播间 URL / 噪声输入。
 - **`src/ui/dashboard.html`** — 控制台单页应用（纯 HTML，无框架）。
 
 ### 关键设计决策

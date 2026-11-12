@@ -238,7 +238,7 @@
       <div class="panel-title">AI 管理员 / 咨询助手</div>
         <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiEnabled" type="checkbox" />启用管理员自动回复</label>
         <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiKnowledge" type="checkbox" />启用知识库检索</label>
-        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiSuggest" type="checkbox" />记录游戏改进建议</label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiSuggest" type="checkbox" />记录游戏改进建议与 BUG</label>
         <input id="aiBaseUrl" placeholder="API 地址，如 https://api.openai.com/v1" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiModel" placeholder="模型名称，如 gpt-4o-mini" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiKey" type="password" placeholder="API Key（保存在本机）" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
@@ -263,8 +263,8 @@
           <div id="kbMsg" style="font-size:10px;color:var(--muted);margin-top:4px;"></div>
         </details>
         <details style="margin:8px 0;border:1px solid var(--border);border-radius:8px;padding:7px 8px;">
-          <summary style="font-size:12px;font-weight:600;cursor:pointer;">游戏改进建议（AI 记录）</summary>
-          <div style="font-size:10px;color:var(--muted);margin:6px 0;">AI 从弹幕中识别出对游戏的具体改进建议时自动记录到这里（同房间 7 天内相同内容只记一条）。</div>
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;">游戏改进建议 / BUG（AI 记录）</summary>
+          <div style="font-size:10px;color:var(--muted);margin:6px 0;">AI 从弹幕中识别出对游戏的具体改进建议或 BUG 反馈时自动记录到这里（同房间 7 天内相同内容只记一条）。</div>
           <div style="display:flex;gap:6px;margin-bottom:6px;"><button id="sgRefresh" class="ghost" style="padding:5px 8px;">刷新</button><button id="sgClear" class="ghost" style="padding:5px 8px;">清空全部</button></div>
           <div id="sgResult" style="font-size:10px;color:var(--muted);max-height:220px;overflow:auto;"></div>
           <div id="sgMsg" style="font-size:10px;color:var(--muted);margin-top:4px;"></div>
@@ -960,7 +960,7 @@ curl -X POST http://${base}/api/webhooks \\
             const original = s.original ? `<div style="color:#999;">原文：${escapeHtml(s.original)}</div>` : '';
             return `<div style="border-top:1px solid #eee;padding:4px 0;">${head} <button class="ghost sg-del" data-id="${s.id}" style="padding:1px 5px;font-size:10px;margin-left:4px;">删除</button><div style="color:#555;white-space:pre-wrap;">${escapeHtml(s.content || '')}</div>${original}</div>`;
           }).join('')
-        : '<div style="color:var(--muted);">暂无记录。AI 判断弹幕是游戏改进建议时会自动写入。</div>';
+        : '<div style="color:var(--muted);">暂无记录。AI 判断弹幕是游戏改进建议或 BUG 时会自动写入。</div>';
       $('sgResult').querySelectorAll('.sg-del').forEach((btn) => {
         btn.onclick = async () => {
           try {

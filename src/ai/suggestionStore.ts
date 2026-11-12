@@ -1,9 +1,9 @@
 /**
- * 游戏改进建议存储 —— AI 从弹幕中提炼的建议落盘保存
+ * 游戏改进建议 / BUG 存储 —— AI 从弹幕中提炼的内容落盘保存
  *
  * 模型在 Agent 循环里调用 record_suggestion 工具，把观众对游戏的改进建议
- * 写入 `data/ai-suggestions.json`。按房间隔离，内容去重（同一房间 7 天内
- * 相同建议只记一条），最多保留最近 2000 条，避免文件无限增长。
+ * 或 BUG 反馈写入 `data/ai-suggestions.json`。按房间隔离，内容去重（同一
+ * 房间 7 天内相同内容只记一条），最多保留最近 2000 条，避免文件无限增长。
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -23,7 +23,7 @@ export interface SuggestionRecord {
   player: string;
   /** 模型给出的分类：玩法 / 平衡 / 功能 / 体验 / 性能 / bug / 其他 */
   category: string;
-  /** 提炼后的建议内容 */
+  /** 提炼后的建议或 BUG 内容 */
   content: string;
   /** 原始弹幕，便于回溯 */
   original?: string;

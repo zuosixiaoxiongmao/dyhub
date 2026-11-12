@@ -39,7 +39,7 @@
   .ai-log-head { padding: 7px 12px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; }
   .ai-log-body { min-height: 0; flex: 1; overflow: auto; padding: 6px 12px; font: 11px/1.5 'SF Mono', Consolas, monospace; }
   .ai-log-row { display: grid; grid-template-columns: 68px 70px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px solid #f0f0ed; white-space: pre-wrap; word-break: break-word; }
-  .ai-log-row.sent .ai-log-status { color: #2d7a4c; } .ai-log-row.skipped .ai-log-status { color: #9b751f; } .ai-log-row.error .ai-log-status { color: #a33; } .ai-log-row.checking .ai-log-status { color: var(--accent-dark); }
+  .ai-log-row.sent .ai-log-status { color: #2d7a4c; } .ai-log-row.skipped .ai-log-status { color: #9b751f; } .ai-log-row.error .ai-log-status { color: #a33; } .ai-log-row.checking .ai-log-status { color: var(--accent-dark); } .ai-log-row.tool .ai-log-status { color: #6b5bd2; }
   .ai-log-status { font-weight: 600; }
   .side-divider { flex: 0 0 auto; height: 0; border: 0; border-top: 1px solid var(--border); margin: 0; }
   .panel-title { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
@@ -135,6 +135,30 @@
   .ov-err { margin-top: 14px; font-size: 12px; color: #a33; background: #fdf0f0; border: 1px solid #f3dada; border-radius: 8px; padding: 8px 10px; word-break: break-all; text-align: left; line-height: 1.5; }
   .ov-note { margin-top: 10px; font-size: 11px; color: var(--muted); }
 
+  /* F3 AI 回复调试面板 */
+  .debug-mask { position: fixed; inset: 0; background: rgba(20, 24, 28, 0.42); backdrop-filter: blur(2px); display: flex; align-items: center; justify-content: center; z-index: 1200; padding: 20px; }
+  .debug-mask[hidden] { display: none; }
+  .debug-card { width: min(760px, 96vw); max-height: 88vh; overflow-y: auto; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 24px 60px rgba(0,0,0,0.22); padding: 18px 20px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .debug-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .debug-title { font-size: 16px; font-weight: 600; }
+  .debug-sub { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.6; }
+  .debug-status { font-size: 11px; color: var(--muted); background: #f7f7f4; border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; word-break: break-all; }
+  .debug-card textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; font: 13px/1.6 inherit; resize: vertical; outline: none; background: #fff; color: var(--text); }
+  .debug-card textarea:focus { border-color: var(--accent-dark); }
+  .debug-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .debug-actions .hint { font-size: 11px; color: var(--muted); }
+  .debug-result { display: flex; flex-direction: column; gap: 7px; }
+  .debug-result[hidden] { display: none; }
+  .debug-reply { white-space: pre-wrap; word-break: break-word; background: #eef6fb; border: 1px solid #cfe6f2; border-radius: 10px; padding: 10px 12px; font-size: 13px; line-height: 1.7; }
+  .debug-reply.skip { background: #faf6ea; border-color: #efe0b8; color: #7a621f; }
+  .debug-reply-head { font-size: 11px; font-weight: 600; color: #2f6f92; margin-bottom: 3px; }
+  .debug-error { background: #fdf0f0; border: 1px solid #f3dada; color: #a33; border-radius: 9px; padding: 9px 11px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .debug-meta { font-size: 11px; color: var(--muted); }
+  .debug-source { display: inline-block; background: #eef6fb; color: #2f6f92; border: 1px solid #cfe6f2; border-radius: 20px; padding: 1px 7px; margin: 2px 4px 2px 0; font-size: 10px; }
+  .debug-steps { margin: 0; padding-left: 18px; font: 11px/1.6 'SF Mono', Consolas, monospace; color: #555; }
+  .debug-steps li { margin: 2px 0; word-break: break-word; }
+  kbd { font: 10px 'SF Mono', Consolas, monospace; background: #f0f0ee; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 1px 5px; }
+
   /* 对接演示视图 */
   .view-docs { overflow-y: auto; padding: 20px; flex-direction: column; gap: 16px; }
   .doc-cards { display: flex; gap: 12px; flex-wrap: wrap; }
@@ -211,16 +235,33 @@
         <div style="font-size:10px;color:var(--muted);margin-top:4px;">多账号不能同时订阅同一直播间</div>
       </div>
       <div>
-      <div class="panel-title">AI 设置</div>
-        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiEnabled" type="checkbox" />启用自动发言</label>
+      <div class="panel-title">AI 管理员 / 咨询助手</div>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiEnabled" type="checkbox" />启用管理员自动回复</label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiKnowledge" type="checkbox" />启用知识库检索</label>
         <input id="aiBaseUrl" placeholder="API 地址，如 https://api.openai.com/v1" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiModel" placeholder="模型名称，如 gpt-4o-mini" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiKey" type="password" placeholder="API Key（保存在本机）" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <div style="display:flex;gap:6px;margin-bottom:6px;"><label style="font-size:11px;flex:1;">检查间隔（秒）<input id="aiInterval" type="number" min="1" max="3600" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label><label style="font-size:11px;flex:1;">读取弹幕条数<input id="aiCount" type="number" min="1" max="100" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label></div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:6px;">关闭时不会处理弹幕或产生 AI 日志；开启后按周期检查新弹幕。</div>
+        <div style="display:flex;gap:6px;margin-bottom:6px;"><label style="font-size:11px;flex:1;">回复最大字数<input id="aiMaxChars" type="number" min="20" max="500" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label><label style="font-size:11px;flex:1;">工具轮数<input id="aiMaxRounds" type="number" min="1" max="6" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label></div>
+        <div style="display:flex;gap:6px;margin-bottom:6px;"><label style="font-size:11px;flex:1;">多条回复间隔（秒）<input id="aiReplyGap" type="number" min="0" max="60" step="0.5" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label><label style="font-size:11px;flex:1;">重复弹幕忽略（秒）<input id="aiDupWindow" type="number" min="0" max="3600" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label></div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px;">多条回复间隔 0 = 不额外等待；重复弹幕忽略窗口 0 = 不去重。关闭自动回复时不会处理弹幕或产生 AI 日志；开启后按周期检查新弹幕，遇到咨询会先检索知识库再回复。</div>
         <div style="display:flex;gap:6px;margin-bottom:6px;"><select id="aiPromptFile" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;"></select><button id="aiNewPrompt" class="ghost" style="padding:5px 8px;">新建风格</button></div>
-        <textarea id="aiPrompt" rows="4" placeholder="提示词文件内容" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;resize:vertical;margin-bottom:6px;"></textarea>
+        <textarea id="aiPrompt" rows="4" placeholder="管理员人设与语气（职责由内置工作流固定）" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;resize:vertical;margin-bottom:6px;"></textarea>
         <button id="aiSavePrompt" class="ghost" style="width:100%;margin-bottom:6px;">保存当前提示词文件</button>
+        <details style="margin:8px 0;border:1px solid var(--border);border-radius:8px;padding:7px 8px;">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;">知识库文档（目录可配置）</summary>
+          <div style="font-size:10px;color:var(--muted);margin:6px 0;">支持 .md / .txt。AI 判断观众在咨询或求助时，会自动检索这些文档并依据内容回答。</div>
+          <div style="display:flex;gap:6px;margin-bottom:4px;"><input id="kbDir" placeholder="知识库目录，默认 data/knowledge" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;" /><button id="kbDirSave" class="ghost" style="padding:5px 8px;">应用目录</button></div>
+          <div id="kbDirHint" style="font-size:10px;color:var(--muted);margin-bottom:6px;"></div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;"><input id="kbNewName" placeholder="新文档名，如 售后说明.md" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;" /><button id="kbNew" class="ghost" style="padding:5px 8px;">新建</button><button id="kbRefresh" class="ghost" style="padding:5px 8px;">刷新</button></div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;"><select id="kbFile" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;"></select><button id="kbImport" class="ghost" style="padding:5px 8px;">导入</button><button id="kbDelete" class="ghost" style="padding:5px 8px;">删除</button><input id="kbImportFile" type="file" accept=".md,.txt,text/markdown,text/plain" style="display:none;" /></div>
+          <textarea id="kbContent" rows="6" placeholder="文档内容，支持 Markdown 标题分段" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;resize:vertical;margin-bottom:6px;"></textarea>
+          <button id="kbSave" class="ghost" style="width:100%;margin-bottom:6px;">保存当前文档</button>
+          <div style="display:flex;gap:6px;margin-bottom:6px;"><input id="kbQuery" placeholder="试检索，如：怎么退款" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;" /><button id="kbSearch" class="ghost" style="padding:5px 8px;">检索</button></div>
+          <div id="kbResult" style="font-size:10px;color:var(--muted);max-height:150px;overflow:auto;"></div>
+          <div id="kbMsg" style="font-size:10px;color:var(--muted);margin-top:4px;"></div>
+        </details>
+        <button id="aiDebugOpen" class="ghost" style="width:100%;margin-bottom:6px;">调试 AI 回复（F3）</button>
         <button id="aiSave" style="width:100%;">保存 AI 设置</button><div id="aiMsg" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
       </div>
       <div>
@@ -329,6 +370,27 @@
     </div>
     <div class="ov-err" id="ovErr" style="display:none;"></div>
     <div class="ov-note" id="ovNote">浏览器内核冷启动约需 3~15 秒</div>
+  </div>
+</div>
+
+<!-- F3 AI 回复调试面板 -->
+<div class="debug-mask" id="aiDebugMask" hidden>
+  <div class="debug-card" role="dialog" aria-modal="true" aria-labelledby="aiDebugTitle">
+    <div class="debug-head">
+      <div>
+        <div class="debug-title" id="aiDebugTitle">AI 回复调试</div>
+        <div class="debug-sub">使用已保存的 AI 设置，模拟观众弹幕，走完整的知识库预检索 / Agent / 回复生成流程；<b>不会发送到直播间</b>。每行一条，格式「昵称：弹幕内容」，不写昵称时按一条测试观众弹幕处理。按 <kbd>F3</kbd> 打开或关闭。</div>
+      </div>
+      <button id="aiDebugClose" class="ghost">关闭</button>
+    </div>
+    <div class="debug-status" id="aiDebugStatus">正在读取配置…</div>
+    <textarea id="aiDebugInput" rows="5" maxlength="2000" placeholder="鸡蛋：你是谁？&#10;番薯：怎样玩？"></textarea>
+    <div class="debug-actions">
+      <button id="aiDebugRun">生成 AI 回复</button>
+      <button id="aiDebugClear" class="ghost">清空</button>
+      <span class="hint" id="aiDebugHint">Ctrl / ⌘ + Enter 快速运行</span>
+    </div>
+    <div class="debug-result" id="aiDebugResult" hidden></div>
   </div>
 </div>
 <script src="/emoji.js"></script>
@@ -726,14 +788,75 @@ curl -X POST http://${base}/api/webhooks \\
     const name = aiPrompts.some(p => p.name === selected) ? selected : aiPrompts[0].name;
     $('aiPromptFile').value = name; $('aiPrompt').value = aiPrompts.find(p => p.name === name).content;
   }
+  let kbDocs = [];
+  let kbResolvedDir = '';
+  function kbErrorText(error) {
+    const msg = error instanceof Error ? error.message : String(error || '');
+    if (/Route .* not found/i.test(msg)) return '服务端还未加载知识库接口（404），请重启 DyHub 服务后刷新页面。';
+    if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) return '无法连接 DyHub 服务，请确认服务仍在运行。';
+    return msg || '未知错误';
+  }
+  async function kbRequest(url, options) {
+    let r;
+    try { r = await fetch(url, options); }
+    catch (e) { throw new Error(kbErrorText(e)); }
+    const text = await r.text();
+    let j = null;
+    if (text) { try { j = JSON.parse(text); } catch {} }
+    if (!r.ok) {
+      const raw = j ? (j.error && j.error !== 'Not Found' ? j.error : (j.message || j.error)) : '';
+      throw new Error(kbErrorText(raw || `HTTP ${r.status}`));
+    }
+    return j;
+  }
+  function renderKbDirHint() {
+    if (!kbResolvedDir) { $('kbDirHint').textContent = ''; return; }
+    const count = kbDocs.length ? `（${kbDocs.length} 篇文档）` : '（暂无文档）';
+    $('kbDirHint').textContent = `当前目录：${kbResolvedDir}${count}`;
+  }
+  async function loadKnowledgeDocs(selected) {
+    try {
+      const data = await kbRequest('/api/ai-chat/knowledge');
+      kbDocs = data && Array.isArray(data.docs) ? data.docs : [];
+      $('kbFile').innerHTML = kbDocs.length
+        ? kbDocs.map(d => `<option value="${escapeHtml(d.name)}">${escapeHtml(d.name)}</option>`).join('')
+        : '<option value="">（暂无文档，点“新建”）</option>';
+      renderKbDirHint();
+      if (!kbDocs.length) { $('kbContent').value = ''; return; }
+      const name = kbDocs.some(d => d.name === selected) ? selected : kbDocs[0].name;
+      $('kbFile').value = name; await loadKnowledgeDoc(name);
+    } catch (e) {
+      kbDocs = [];
+      $('kbFile').innerHTML = '<option value="">（加载失败）</option>';
+      $('kbContent').value = ''; renderKbDirHint();
+      $('kbMsg').textContent = `加载文档列表失败：${kbErrorText(e)}`;
+    }
+  }
+  async function loadKnowledgeDoc(name) {
+    if (!name) { $('kbContent').value = ''; return; }
+    try {
+      const j = await kbRequest(`/api/ai-chat/knowledge/${encodeURIComponent(name)}`);
+      $('kbContent').value = j && j.doc && typeof j.doc.content === 'string' ? j.doc.content : '';
+    } catch (e) {
+      $('kbContent').value = '';
+      $('kbMsg').textContent = `读取文档失败：${kbErrorText(e)}`;
+    }
+  }
   async function loadAiConfig() {
     try { const c = await (await fetch('/api/ai-chat')).json();
       $('aiEnabled').checked = c.enabled; $('aiBaseUrl').value = c.baseUrl; $('aiModel').value = c.model;
       $('aiKey').placeholder = c.apiKey ? '已保存 API Key；留空保持不变' : 'API Key（保存在本机）';
-      $('aiCount').value = c.count; $('aiInterval').value = c.intervalSec; await loadPrompts(c.promptFile); updateAiLogConnection();
-    } catch {}
+      $('aiKnowledge').checked = c.knowledgeEnabled !== false;
+      $('kbDir').value = c.knowledgeDir || 'data/knowledge';
+      kbResolvedDir = c.knowledgeDirResolved || '';
+      $('aiMaxChars').value = c.replyMaxChars || 180; $('aiMaxRounds').value = c.maxRounds || 3;
+      $('aiReplyGap').value = Number(c.replyIntervalMs ?? 3000) / 1000; $('aiDupWindow').value = c.duplicateWindowSec ?? 300;
+      $('aiCount').value = c.count; $('aiInterval').value = c.intervalSec;
+      try { await loadPrompts(c.promptFile); } catch (e) { $('aiMsg').textContent = `加载提示词失败：${kbErrorText(e)}`; }
+      await loadKnowledgeDocs(); updateAiLogConnection();
+    } catch (e) { $('aiMsg').textContent = `加载 AI 配置失败：${kbErrorText(e)}`; }
   }
-  const aiLogStatus = { checking: '判断中', skipped: '未回复', sent: '已回复', error: '错误' };
+  const aiLogStatus = { checking: '判断中', tool: '检索中', skipped: '未回复', sent: '已回复', error: '错误' };
   const seenAiLogIds = new Set();
   function appendAiLog(log) {
     if (seenAiLogIds.has(log.id)) return;
@@ -741,11 +864,82 @@ curl -X POST http://${base}/api/webhooks \\
     const body = $('aiLogBody'); const empty = body.querySelector('div[style]'); if (empty && body.children.length === 1) body.innerHTML = '';
     const row = document.createElement('div'); row.className = `ai-log-row ${log.status}`;
     const time = new Date(log.ts).toLocaleTimeString();
-    const detail = [log.roomId ? `房间 ${log.roomId}` : '', log.inputCount ? `${log.inputCount} 条新弹幕` : '', log.message || '', log.output ? `LLM：${log.output}` : ''].filter(Boolean).join(' · ');
+    const sources = Array.isArray(log.sources) && log.sources.length ? `📚 ${log.sources.join('、')}` : '';
+    const detail = [log.roomId ? `房间 ${log.roomId}` : '', log.inputCount ? `${log.inputCount} 条新弹幕` : '', log.message || '', sources, log.output ? `LLM：${log.output}` : ''].filter(Boolean).join(' · ');
     row.innerHTML = `<span>${escapeHtml(time)}</span><span class="ai-log-status">${aiLogStatus[log.status] || log.status}</span><span>${escapeHtml(detail)}</span>`;
     body.appendChild(row); while (body.children.length > 200) body.removeChild(body.firstChild); body.scrollTop = body.scrollHeight;
     $('aiLogState').textContent = log.message || aiLogStatus[log.status] || '';
   }
+  $('kbDirSave').onclick = async () => {
+    try {
+      const j = await kbRequest('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ knowledgeDir: $('kbDir').value }) });
+      $('kbDir').value = j.config.knowledgeDir;
+      kbResolvedDir = j.config.knowledgeDirResolved || '';
+      await loadKnowledgeDocs();
+      $('kbMsg').textContent = '知识库目录已切换，文档列表已刷新。';
+    } catch (e) { $('kbMsg').textContent = `目录设置失败：${kbErrorText(e)}`; }
+  };
+  $('kbFile').onchange = () => loadKnowledgeDoc($('kbFile').value);
+  $('kbRefresh').onclick = () => loadKnowledgeDocs($('kbFile').value);
+  $('kbNew').onclick = async () => {
+    const input = $('kbNewName').value.trim();
+    if (!input) { $('kbMsg').textContent = '请先填写新文档名'; $('kbNewName').focus(); return; }
+    const filename = /\.(md|txt)$/i.test(input) ? input : `${input}.md`;
+    const title = filename.replace(/\.(md|txt)$/i, '');
+    try {
+      await kbRequest(`/api/ai-chat/knowledge/${encodeURIComponent(filename)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: `# ${title}\n\n` }) });
+      $('kbNewName').value = '';
+      await loadKnowledgeDocs(filename);
+      $('kbMsg').textContent = '文档已创建，编辑内容后点“保存当前文档”。';
+    } catch (e) { $('kbMsg').textContent = `创建失败：${kbErrorText(e)}`; }
+  };
+  $('kbImport').onclick = () => $('kbImportFile').click();
+  $('kbImportFile').onchange = async () => {
+    const file = $('kbImportFile').files && $('kbImportFile').files[0];
+    if (!file) return;
+    try {
+      if (!/\.(md|txt)$/i.test(file.name)) throw new Error('仅支持 .md / .txt 文件');
+      if (file.size > 2 * 1024 * 1024) throw new Error('文档不能超过 2MB');
+      if (kbDocs.some(d => d.name === file.name) && !confirm(`文档 ${file.name} 已存在，确定覆盖？`)) return;
+      const content = await file.text();
+      await kbRequest(`/api/ai-chat/knowledge/${encodeURIComponent(file.name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+      await loadKnowledgeDocs(file.name);
+      $('kbMsg').textContent = `已导入 ${file.name}，下一轮检索立即生效。`;
+    } catch (e) { $('kbMsg').textContent = `导入失败：${kbErrorText(e)}`; }
+    finally { $('kbImportFile').value = ''; }
+  };
+  $('kbSave').onclick = async () => {
+    const name = $('kbFile').value;
+    if (!name) { $('kbMsg').textContent = '请先新建或选择文档'; return; }
+    try {
+      await kbRequest(`/api/ai-chat/knowledge/${encodeURIComponent(name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: $('kbContent').value }) });
+      await loadKnowledgeDocs(name);
+      $('kbMsg').textContent = '文档已保存，下一轮检索立即生效。';
+    } catch (e) { $('kbMsg').textContent = `保存失败：${kbErrorText(e)}`; }
+  };
+  $('kbDelete').onclick = async () => {
+    const name = $('kbFile').value; if (!name) return;
+    if (!confirm(`确定删除知识库文档 ${name}？`)) return;
+    try {
+      await kbRequest(`/api/ai-chat/knowledge/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      $('kbResult').innerHTML = '';
+      await loadKnowledgeDocs();
+      $('kbMsg').textContent = '文档已删除。';
+    } catch (e) { $('kbMsg').textContent = `删除失败：${kbErrorText(e)}`; }
+  };
+  $('kbSearch').onclick = async () => {
+    const query = $('kbQuery').value.trim(); if (!query) return;
+    try {
+      const j = await kbRequest('/api/ai-chat/knowledge/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query, limit: 5 }) });
+      const hits = j && Array.isArray(j.hits) ? j.hits : [];
+      $('kbResult').innerHTML = hits.length
+        ? hits.map((h, i) => {
+            const content = typeof h.content === 'string' ? h.content : '';
+            return `<div style="border-top:1px solid #eee;padding:4px 0;"><b>${i + 1}. ${escapeHtml(h.doc || '')}${h.heading ? ` / ${escapeHtml(h.heading)}` : ''}</b><div style="color:#555;white-space:pre-wrap;">${escapeHtml(content.slice(0, 160))}${content.length > 160 ? '…' : ''}</div></div>`;
+          }).join('')
+        : '<div style="color:var(--muted);">没有命中，换几个关键词试试。</div>';
+    } catch (e) { $('kbResult').textContent = `检索失败：${kbErrorText(e)}`; }
+  };
   let aiLogStream = null; let aiLogRetry = null;
   function connectAiLogs() {
     if (!$('aiEnabled').checked) { $('aiLogState').textContent = '自动发言未启用'; return; }
@@ -777,8 +971,15 @@ curl -X POST http://${base}/api/webhooks \\
     const j = await r.json(); $('aiMsg').textContent = r.ok ? '提示词文件已保存。' : (j.error || '保存失败'); if (r.ok) await loadPrompts(name);
   };
   $('aiSave').onclick = async () => {
-    const r = await fetch('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), promptFile: $('aiPromptFile').value }) });
-    const j = await r.json(); $('aiMsg').textContent = r.ok ? '设置已保存；对所有运行中的直播间生效。' : (j.error || '保存失败'); $('aiKey').value = ''; if (r.ok) updateAiLogConnection();
+    try {
+      const j = await kbRequest('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, knowledgeEnabled: $('aiKnowledge').checked, knowledgeDir: $('kbDir').value, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), replyMaxChars: Number($('aiMaxChars').value), maxRounds: Number($('aiMaxRounds').value), replyIntervalMs: Number($('aiReplyGap').value) * 1000, duplicateWindowSec: Number($('aiDupWindow').value), promptFile: $('aiPromptFile').value }) });
+      $('aiMsg').textContent = '设置已保存；对所有运行中的直播间生效。';
+      $('aiKey').value = '';
+      $('kbDir').value = j.config.knowledgeDir;
+      kbResolvedDir = j.config.knowledgeDirResolved || '';
+      await loadKnowledgeDocs();
+      updateAiLogConnection();
+    } catch (e) { $('aiMsg').textContent = `保存失败：${kbErrorText(e)}`; }
   };
 
   async function connect(roomId) {
@@ -1054,6 +1255,98 @@ curl -X POST http://${base}/api/webhooks \\
       loginTimer = setInterval(pollLogin, 1500);
     }
   }).catch(() => {});
+  // ---- F3 AI 回复调试 ----
+  function renderAiDebugResult(j) {
+    const box = $('aiDebugResult');
+    box.hidden = false;
+    if (!j || j.ok === false) {
+      box.innerHTML = `<div class="debug-error">${escapeHtml((j && j.error) || '测试失败')}</div>`;
+      return;
+    }
+    const meta = [`耗时 ${Number(j.elapsedMs) || 0} ms`, `模型轮数 ${Number(j.rounds) || 0}`];
+    const sources = Array.isArray(j.sources) && j.sources.length
+      ? `<div class="debug-meta">知识库来源：${j.sources.map((s) => `<span class="debug-source">${escapeHtml(s)}</span>`).join('')}</div>`
+      : '<div class="debug-meta">知识库来源：无命中</div>';
+    const steps = Array.isArray(j.steps) && j.steps.length
+      ? `<div class="debug-meta">执行步骤</div><ol class="debug-steps">${j.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>`
+      : '';
+    if (j.skipped) {
+      const reason = j.skipReason === 'empty' ? '未生成有效回复' : '无需回复';
+      box.innerHTML = `<div class="debug-meta">AI 判断：<b>${reason}</b> · ${meta.join(' · ')}</div><div class="debug-reply skip">${escapeHtml(j.raw || '[SKIP]')}</div>${sources}${steps}`;
+      return;
+    }
+    // 模型可能同时回复多个观众：逐条展示，正式发言时会按间隔依次发送
+    const replies = Array.isArray(j.replies) && j.replies.length
+      ? j.replies
+      : [{ player: '', content: j.reply || '' }];
+    const list = replies.map((r, i) => {
+      const name = r && r.player ? r.player : `观众 ${i + 1}`;
+      return `<div class="debug-reply"><div class="debug-reply-head">${escapeHtml(name)}</div>${escapeHtml((r && r.content) || '')}</div>`;
+    }).join('');
+    const gapSec = Number(j.replyIntervalMs) >= 0 ? Number(j.replyIntervalMs) / 1000 : 3;
+    const ignored = Number(j.duplicates) > 0 ? ` · 已忽略 ${Number(j.duplicates)} 条重复弹幕` : '';
+    box.innerHTML = `<div class="debug-meta">生成 ${replies.length} 条回复（正式发言时每条间隔 ${gapSec} 秒${ignored}）· ${meta.join(' · ')}</div>${list}${sources}${steps}`;
+  }
+  async function refreshAiDebugStatus() {
+    try {
+      const c = await kbRequest('/api/ai-chat');
+      const model = c.model ? `模型 ${c.model}` : '未配置模型';
+      const key = c.apiKey ? 'API Key 已配置' : '未配置 API Key';
+      const kb = c.knowledgeEnabled ? `知识库开启（${c.knowledgeDirResolved || c.knowledgeDir}）` : '知识库已关闭';
+      const auto = c.enabled ? '自动回复已启用' : '自动回复未启用（调试仍可用）';
+      const gap = `回复间隔 ${Number(c.replyIntervalMs ?? 3000) / 1000} 秒`;
+      const dup = Number(c.duplicateWindowSec) > 0 ? `重复忽略 ${c.duplicateWindowSec} 秒` : '不忽略重复';
+      $('aiDebugStatus').textContent = `${model} · ${key} · ${kb} · ${gap} · ${dup} · ${auto}`;
+    } catch (e) {
+      $('aiDebugStatus').textContent = `读取 AI 配置失败：${kbErrorText(e)}`;
+    }
+  }
+  function showAiDebug(open) {
+    $('aiDebugMask').hidden = !open;
+    if (open) {
+      refreshAiDebugStatus();
+      setTimeout(() => $('aiDebugInput').focus(), 0);
+    }
+  }
+  async function runAiDebug() {
+    const text = $('aiDebugInput').value.trim();
+    if (!text) { $('aiDebugHint').textContent = '请先输入一条观众弹幕'; $('aiDebugInput').focus(); return; }
+    const btn = $('aiDebugRun');
+    btn.disabled = true;
+    $('aiDebugHint').textContent = 'AI 正在生成回复…';
+    $('aiDebugResult').hidden = true;
+    const started = Date.now();
+    try {
+      const j = await kbRequest('/api/ai-chat/test-reply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+      renderAiDebugResult(j);
+      $('aiDebugHint').textContent = j && j.ok ? `完成，用时 ${Date.now() - started} ms` : '生成失败';
+    } catch (e) {
+      $('aiDebugResult').hidden = false;
+      $('aiDebugResult').innerHTML = `<div class="debug-error">${escapeHtml(kbErrorText(e))}</div>`;
+      $('aiDebugHint').textContent = '请求失败';
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  $('aiDebugOpen').onclick = () => showAiDebug(true);
+  $('aiDebugClose').onclick = () => showAiDebug(false);
+  $('aiDebugClear').onclick = () => {
+    $('aiDebugInput').value = '';
+    $('aiDebugResult').hidden = true;
+    $('aiDebugResult').innerHTML = '';
+    $('aiDebugHint').textContent = 'Ctrl / ⌘ + Enter 快速运行';
+    $('aiDebugInput').focus();
+  };
+  $('aiDebugRun').onclick = runAiDebug;
+  $('aiDebugInput').addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); runAiDebug(); }
+  });
+  $('aiDebugMask').addEventListener('click', (e) => { if (e.target === $('aiDebugMask')) showAiDebug(false); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'F3') { e.preventDefault(); showAiDebug($('aiDebugMask').hidden); }
+    else if (e.key === 'Escape' && !$('aiDebugMask').hidden) showAiDebug(false);
+  });
+
   refreshAccounts();
   loadAiConfig();
 

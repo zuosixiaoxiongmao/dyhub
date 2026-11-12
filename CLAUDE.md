@@ -52,7 +52,11 @@ docker compose up -d --build   # 一键启动（内置 Chromium + 中文字体�
   - `wsServer.ts` — WebSocket 实时推送（`/ws?roomId=&types=`），复用 Fastify 的 HTTP server。
   - `sseServer.ts` — SSE 推送（`/api/events?roomId=&types=`），15s 心跳防代理断开。
   - `webhook.ts` — Webhook 投递，HMAC-SHA256 签名（`X-DyHub-Signature` 头），5s 超时。
-- **`src/api/server.ts`** — Fastify 管理 API（控制面）。房间管理、Webhook 管理、统计、SSE 路由注册、控制台静态资源。`normalizeRoomIdInput` 兼容全角数字 / 直播间 URL / 噪声输入。
+- **`src/ai/`** — AI 管理员 / 咨询助手（配置在 `data/ai-chat.json`，控制台面板管理）。
+  - `chatAssistant.ts` — 按房间聚合弹幕，按 `intervalSec` 触发 Agent；先对问题句做知识库预检索并注入提示词，模型可在资料不足时调用 `search_knowledge` 补充；接口不支持 `tools` 时自动降级为“预检索资料 + 普通对话”。模型按观众输出 JSON（`{"1":{"player_name","content"}}`），`parseReplies()` 拆成多条回复，一个观众一条，相邻两条按 `replyIntervalMs`（默认 `DYHUB_AI_REPLY_INTERVAL_MS` = 3000ms）间隔发送；兼容数组 / 外壳 / 旧版纯文本。`filterDuplicateChats()` / `markHandledChats()` 用 `chatSignature()`（归一化后去空格标点）抑制重复弹幕：同批相同内容只处理一次，`duplicateWindowSec`（默认 300 秒，0 = 关闭）内已处理的相同内容直接跳过，不调用模型；同一玩家一轮最多一条，只有成功回复的玩家会被标记为已处理。正式发言与 F3 调试面板共用 `composeReply()`，调试走 `POST /api/ai-chat/test-reply`（多行输入每行 `昵称：内容` 为一条模拟弹幕）且不发送弹幕。运行日志经 `/api/ai-chat/log-stream` 实时推送。
+  - `agent.ts` — 轻量 Agent 工作流：OpenAI 兼容 `tools` / `tool_calls` 循环，最多 `maxRounds` 轮，支持一次调用多个工具与轮数上限收敛。**新增工具只需实现 `AgentTool` 接口并注册**，不改循环。
+  - `knowledgeBase.ts` — 文档知识库。读取配置目录（`AiConfig.knowledgeDir`，默认 `data/knowledge`，支持绝对/相对路径，可用 `DYHUB_KNOWLEDGE_DIR` 改默认值）下的 `*.md|*.txt`，按 Markdown 标题 / 段落切块（700 字、100 字重叠），用中文二元词 + BM25 简化算法本地检索。`KnowledgeRetriever` / `KnowledgeDocumentStore` 是替换为向量库或远程知识服务的扩展点。目录规则、文档写法与排障见 `docs/knowledge-guide.md`。
+- **`src/api/server.ts`** — Fastify 管理 API（控制面）。房间管理、Webhook 管理、统计、SSE 路由注册、AI 配置 / 知识库 CRUD、控制台静态资源。`normalizeRoomIdInput` 兼容全角数字 / 直播间 URL / 噪声输入。
 - **`src/ui/dashboard.html`** — 控制台单页应用（纯 HTML，无框架）。
 
 ### 关键设计决策
@@ -77,12 +81,16 @@ docker compose up -d --build   # 一键启动（内置 Chromium + 中文字体�
 | `DYHUB_COLLECTOR` | `browser`（默认）/ `lightweight` | `browser` |
 | `DYHUB_COOKIE` | 轻量内核直用 cookie（`ttwid=…; __ac_nonce=…`） | 自动获取 |
 | `DYHUB_CHAT_INTERVAL_MS` | 同房间两条弹幕发送的最小间隔（防风控） | `3000` |
+| `DYHUB_AI_REPLY_INTERVAL_MS` | AI 同时回复多个观众时，相邻两条回复的间隔默认值（控制台 `replyIntervalMs` 优先） | `3000` |
+| `DYHUB_KNOWLEDGE_DIR` | AI 知识库目录默认值（绝对路径或相对运行目录；控制台 `knowledgeDir` 优先） | `data/knowledge` |
 
 ### 扩展点
 
 - **多平台**：新增 `collector/<platform>.ts` 实现 `SessionLike` 接口，复用同一事件协议与分发层。`DanmakuEvent.platform` 字段已预留。
 - **新事件类型**：在 `types/events.ts` 加类型 → `normalizer.ts` 加 case → 消费端即可使用。
 - **新分发通道**：订阅 `EventBus`，按 `EventFilter` 过滤推送。
+- **AI 新工具**：在 `src/ai/` 实现 `AgentTool`（`name` / `description` / JSON Schema `parameters` / `execute`），在 `ChatAssistant.maybeSpeak` 的 `tools` 数组注册。Agent 循环自动处理多轮与多工具调用，日志会记录每次工具执行。
+- **AI 新知识源**：实现 `KnowledgeRetriever`（`src/ai/knowledgeBase.ts`）并替换 `ChatAssistant` 中的 `DocumentKnowledgeBase`，可接入向量检索 / 远程知识库；Agent 工具层不需要改动。
 
 ## 注意事项
 

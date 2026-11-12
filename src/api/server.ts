@@ -47,13 +47,23 @@ export interface ApiDeps {
 
 export function buildApi(deps: ApiDeps): FastifyInstance {
   const app = Fastify({ logger: false });
+  // 控制台 HTML 每次回源校验，避免升级后浏览器继续用旧页面（看不到新增面板）。
+  // @fastify/static 会用自己的 cache-control 覆盖 setHeaders，因此在 onSend 里统一设置。
+  app.addHook('onSend', async (req, reply, payload) => {
+    if (req.url === '/' || /\.html?(?:\?|$)/i.test(req.url)) {
+      reply.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
+    return payload;
+  });
 
   app.get('/api/ai-chat', async () => deps.aiAssistant.getConfig());
   app.get('/api/ai-chat/logs', async () => ({ logs: deps.aiAssistant.getLogs() }));
   app.put('/api/ai-chat', async (req, reply) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     if (body.enabled !== undefined && typeof body.enabled !== 'boolean') return reply.code(400).send({ error: 'enabled 必须是布尔值' });
-    return { ok: true, config: deps.aiAssistant.update(body as any) };
+    if (body.knowledgeDir !== undefined && typeof body.knowledgeDir !== 'string') return reply.code(400).send({ error: 'knowledgeDir 必须是字符串' });
+    try { return { ok: true, config: deps.aiAssistant.update(body as any) }; }
+    catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }); }
   });
   app.get('/api/ai-chat/prompts', async () => ({ prompts: deps.aiAssistant.listPrompts() }));
   app.put('/api/ai-chat/prompts/:name', async (req, reply) => {
@@ -62,6 +72,42 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     if (typeof content !== 'string') return reply.code(400).send({ error: 'content 必须是字符串' });
     try { return { ok: true, prompt: deps.aiAssistant.savePrompt(name, content) }; }
     catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }); }
+  });
+
+  // ---- AI 知识库（文档库）：Agent 检索与人工维护共用同一份 data/knowledge ----
+  app.get('/api/ai-chat/knowledge', async () => ({ docs: deps.aiAssistant.listKnowledge() }));
+  app.get('/api/ai-chat/knowledge/:name', async (req, reply) => {
+    const { name } = req.params as { name: string };
+    try { return { doc: deps.aiAssistant.getKnowledge(name) }; }
+    catch (e) { return reply.code(404).send({ error: e instanceof Error ? e.message : String(e) }); }
+  });
+  app.put('/api/ai-chat/knowledge/:name', { bodyLimit: 3 * 1024 * 1024 }, async (req, reply) => {
+    const { name } = req.params as { name: string };
+    const { content } = (req.body ?? {}) as { content?: unknown };
+    if (typeof content !== 'string') return reply.code(400).send({ error: 'content 必须是字符串' });
+    try { return { ok: true, doc: deps.aiAssistant.saveKnowledge(name, content) }; }
+    catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }); }
+  });
+  app.delete('/api/ai-chat/knowledge/:name', async (req, reply) => {
+    const { name } = req.params as { name: string };
+    try {
+      if (!deps.aiAssistant.removeKnowledge(name)) return reply.code(404).send({ error: '文档不存在' });
+      return { ok: true };
+    } catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }); }
+  });
+  app.post('/api/ai-chat/knowledge/search', async (req, reply) => {
+    const { query, limit } = (req.body ?? {}) as { query?: unknown; limit?: unknown };
+    if (typeof query !== 'string' || !query.trim()) return reply.code(400).send({ error: 'query 必填' });
+    const hits = await deps.aiAssistant.searchKnowledge(query, Math.max(1, Math.min(10, Math.floor(Number(limit) || 4))));
+    return { hits };
+  });
+
+  // 调试面板：用一条模拟弹幕测试 AI 回复，不发送到直播间
+  app.post('/api/ai-chat/test-reply', async (req, reply) => {
+    const { text } = (req.body ?? {}) as { text?: unknown };
+    if (typeof text !== 'string' || !text.trim()) return reply.code(400).send({ error: 'text 必填' });
+    if (text.length > 2000) return reply.code(400).send({ error: 'text 不能超过 2000 字' });
+    return await deps.aiAssistant.testReply(text);
   });
 
   // 控制台静态资源

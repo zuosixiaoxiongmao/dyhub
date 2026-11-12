@@ -38,6 +38,7 @@ DyHub 是一个抖音直播弹幕采集与分发中台：**双采集内核自研
 - **多账号管理**：抖音同一账号同一时间只能在一个直播间，多房间共用登录态会互相竞争导致礼物信息丢失。支持多账号隔离（每个账号独立 cookie），连接房间时选择账号，持久化到磁盘，Docker 重新部署自动恢复；同一房间不能被多个账号同时订阅
 - **房间生命周期管理**：连接过程分步进度展示（浏览器启动 → 订阅监听 → 连接成功），支持停止保留 / 一键恢复 / 彻底删除
 - **可视化控制台**：实时弹幕流（头像 / 事件类型 / 来源房间 / 昵称）、事件筛选、房间管理、对接演示与在线测试
+- **AI 管理员 / 咨询助手**：按间隔判断弹幕中的咨询与求助，自动预检索本地文档知识库并可按需调用 `search_knowledge` 补充，再由 LLM 生成完整回复并回发弹幕；支持多提示词人设、知识库在线维护、实时检索日志、重复弹幕抑制与不支持工具调用时的自动降级
 - **可插拔扩展**：新增平台只需写一个 collector 适配器，复用同一套事件协议与分发层
 
 ---
@@ -149,6 +150,8 @@ curl -X POST http://localhost:8757/api/rooms/connect \
 | `DYHUB_COLLECTOR` | 采集内核：`browser`（默认，浏览器 + CDP，最稳抗风控）/ `lightweight`（纯代码直连，轻量快速） | `browser` |
 | `DYHUB_COOKIE` | 浏览器复制的 Cookie（含 `sessionid_ss` 登录态），用于**获取礼物事件**与**绕过容器 IP 风控**；也可以控制台账号卡片「导入 Cookie」或网页登录 → 详见 [Cookie 配置指南](docs/cookie-guide.md) | 无（游客态） |
 | `DYHUB_CHAT_INTERVAL_MS` | `POST /api/rooms/:roomId/chat` 同一房间两条弹幕的最小间隔（毫秒） | `3000` |
+| `DYHUB_AI_REPLY_INTERVAL_MS` | AI 同时回复多个观众时，相邻两条回复的间隔默认值（毫秒；控制台保存的「多条回复间隔」优先） | `3000` |
+| `DYHUB_KNOWLEDGE_DIR` | AI 知识库目录的默认值（支持绝对路径 / 相对运行目录；控制台保存的目录优先）→ 详见 [知识库配置指南](docs/knowledge-guide.md) | `data/knowledge` |
 
 ---
 
@@ -244,6 +247,31 @@ curl -X POST http://localhost:8757/api/webhooks \
 
 ---
 
+## 🤖 AI 管理员 / 咨询助手
+
+控制台「AI 管理员 / 咨询助手」面板可配置任意 OpenAI 兼容接口。启用后：
+
+1. 按房间聚合新弹幕，先对像问题的弹幕做本地预检索，把知识库片段注入提示词；
+2. 模型判断是否有观众在咨询或求助；资料不足时可再调用 `search_knowledge` 补充检索 `data/knowledge/` 下的 `.md` / `.txt` 文档；
+3. 模型按观众输出 JSON（`{"1":{"player_name":"昵称","content":"回复"}}`），系统拆成多条弹幕，一个观众回复一条，相邻两条默认间隔 3 秒发送（控制台「多条回复间隔」或 `DYHUB_AI_REPLY_INTERVAL_MS` 可调）。接口不支持 `tools` 时自动降级为“预检索资料 + 普通对话”，知识库仍然生效。
+
+重复弹幕会被抑制：同一批里内容相同的只处理一次，处理过的内容在「重复弹幕忽略」窗口（默认 300 秒）内再次出现时直接跳过，不调用模型也不发送；同一观众一轮最多回复一条。窗口设为 `0` 可关闭去重。比较时会忽略空格、标点和大小写，因此「怎样玩？」和「怎样玩 ?」视为同一条。
+
+知识库目录默认是 `data/knowledge/`，可在控制台「知识库文档」里填绝对路径或相对运行目录的路径后点「应用目录」；部署时也可用 `DYHUB_KNOWLEDGE_DIR` 指定默认值。文档可直接在控制台新建 / 导入 / 编辑 / 删除，也可手工放进该目录。检索使用本地中文二元词 + BM25，无需向量库；`KnowledgeRetriever` / `AgentTool` 接口预留了替换为向量检索、远程知识库或新增「订单查询」等工具的位置。
+
+**调试回复**：在控制台任意位置按 `F3`（或点 AI 面板的「调试 AI 回复」）打开调试面板。**每行一条**模拟弹幕，格式 `昵称：弹幕内容`（不写昵称时按「测试观众」处理），例如：
+
+```text
+鸡蛋：你是谁？
+番薯：怎样玩？
+```
+
+点「生成 AI 回复」后会走完整的预检索 / Agent / 回复解析流程，逐条列出每个观众的回复，并显示回复间隔、被忽略的重复弹幕、命中的知识文档、执行步骤和耗时。调试使用已保存的 AI 设置，**不会发送到直播间**。每次测试会真实调用一次 LLM 接口。
+
+完整的目录配置、文档写法、API 示例与排障说明见 **[知识库配置指南](docs/knowledge-guide.md)**。
+
+---
+
 ## 📡 API 参考
 
 | 方法 | 路径 | 说明 |
@@ -265,6 +293,13 @@ curl -X POST http://localhost:8757/api/webhooks \
 | DELETE | `/api/accounts/:id` | 删除账号 |
 | GET | `/api/events?types=chat,gift&roomId=xxx` | SSE 实时事件流 |
 | GET/POST/DELETE | `/api/webhooks` | Webhook 订阅管理 |
+| GET/PUT | `/api/ai-chat` | AI 管理员配置（开关 / 模型 / 间隔 / 回复字数 / 多条回复间隔 `replyIntervalMs` / 重复弹幕窗口 `duplicateWindowSec` / 知识库开关 / 工具轮数） |
+| GET | `/api/ai-chat/logs` | 最近 AI 判断、工具调用与回复日志 |
+| WS | `/api/ai-chat/log-stream` | AI 实时日志流 |
+| GET/PUT | `/api/ai-chat/prompts[/:name]` | 人设提示词列表 / 保存 |
+| GET/PUT/DELETE | `/api/ai-chat/knowledge[/:name]` | 知识库文档列表 / 读取 / 保存 / 删除 |
+| POST | `/api/ai-chat/knowledge/search` | 调试知识库检索 `{query, limit?}` |
+| POST | `/api/ai-chat/test-reply` | F3 调试面板：`{text}` 可多行（每行 `昵称：内容` 为一条模拟弹幕），生成回复但不发送到直播间 |
 
 ---
 
@@ -290,6 +325,10 @@ src/
 │   ├── wsServer.ts          # WebSocket 实时推送
 │   ├── sseServer.ts         # SSE 推送
 │   └── webhook.ts           # Webhook 投递（HMAC 签名）
+├── ai/
+│   ├── chatAssistant.ts     # AI 管理员：弹幕聚合 / 调度 / 日志
+│   ├── agent.ts             # 轻量 Agent 工具调用循环（可扩展工具）
+│   └── knowledgeBase.ts     # 文档知识库（切块 + 中文 BM25 检索）
 ├── api/server.ts            # Fastify 管理 API
 └── ui/dashboard.html        # 控制台单页应用
 ```
@@ -333,7 +372,8 @@ docker run -d --name dyhub -p 8757:8757 --shm-size=2g dyhub
 | `DYHUB_PORT` / `DYHUB_HOST` | 默认 `8757` / `0.0.0.0`，改端口时同步改端口映射 |
 | `DYHUB_HEADED` | 容器内保持 `0`（无头），不要打开有头 |
 | `DYHUB_CHROME` | 镜像已内置 `/usr/bin/chromium` |
-| `DYHUB_COOKIE` | 容器 IP 被风控或需获取礼物事件时，填入浏览器复制的登录 Cookie → 详见 [Cookie 配置指南](cookie-guide.md) |
+| `DYHUB_COOKIE` | 容器 IP 被风控或需获取礼物事件时，填入浏览器复制的登录 Cookie → 详见 [Cookie 配置指南](docs/cookie-guide.md) |
+| `DYHUB_KNOWLEDGE_DIR` | AI 知识库目录（容器内路径），默认 `/app/data/knowledge`；需配合 volume 挂载 → 详见 [知识库配置指南](docs/knowledge-guide.md) |
 | 健康检查 | 每 30s 探测 `/api/stats`，`docker ps` 可查状态 |
 
 ---
@@ -341,7 +381,7 @@ docker run -d --name dyhub -p 8757:8757 --shm-size=2g dyhub
 ## 🧩 扩展点 / Roadmap
 
 - **规则引擎**：事件总线 + `type + user + content` 规则匹配 → 触发动作
-- **AI 助理**：消费 `chat` 事件喂给 LLM，回复经 OBS / 弹幕回发
+- **AI 助理**：已内置管理员 / 咨询助手（知识库检索 + 工具调用）；可继续扩展订单查询、商品推荐等 `AgentTool`
 - **弹幕游戏**：`member` / `chat` 事件驱动游戏状态机
 - **数据看板**：`room` 事件做在线趋势、`gift` 做营收统计
 - **多平台**：新增 `collector/bilibili.ts` 等适配器，复用同一事件协议

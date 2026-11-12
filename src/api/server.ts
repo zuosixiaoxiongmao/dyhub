@@ -102,6 +102,22 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     return { hits };
   });
 
+  // ---- 游戏改进建议：AI 通过 record_suggestion 工具写入 data/ai-suggestions.json ----
+  app.get('/api/ai-chat/suggestions', async (req) => {
+    const { roomId, limit } = req.query as { roomId?: string; limit?: string };
+    return { suggestions: deps.aiAssistant.listSuggestions(roomId, Number(limit) || 200) };
+  });
+  app.delete('/api/ai-chat/suggestions/:id', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'id 无效' });
+    if (!deps.aiAssistant.removeSuggestion(id)) return reply.code(404).send({ error: '建议不存在' });
+    return { ok: true };
+  });
+  app.delete('/api/ai-chat/suggestions', async (req) => {
+    const { roomId } = req.query as { roomId?: string };
+    return { ok: true, removed: deps.aiAssistant.clearSuggestions(roomId) };
+  });
+
   // 调试面板：用一条模拟弹幕测试 AI 回复，不发送到直播间
   app.post('/api/ai-chat/test-reply', async (req, reply) => {
     const { text } = (req.body ?? {}) as { text?: unknown };

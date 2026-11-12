@@ -238,6 +238,7 @@
       <div class="panel-title">AI 管理员 / 咨询助手</div>
         <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiEnabled" type="checkbox" />启用管理员自动回复</label>
         <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiKnowledge" type="checkbox" />启用知识库检索</label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiSuggest" type="checkbox" />记录游戏改进建议</label>
         <input id="aiBaseUrl" placeholder="API 地址，如 https://api.openai.com/v1" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiModel" placeholder="模型名称，如 gpt-4o-mini" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiKey" type="password" placeholder="API Key（保存在本机）" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
@@ -260,6 +261,13 @@
           <div style="display:flex;gap:6px;margin-bottom:6px;"><input id="kbQuery" placeholder="试检索，如：怎么退款" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;" /><button id="kbSearch" class="ghost" style="padding:5px 8px;">检索</button></div>
           <div id="kbResult" style="font-size:10px;color:var(--muted);max-height:150px;overflow:auto;"></div>
           <div id="kbMsg" style="font-size:10px;color:var(--muted);margin-top:4px;"></div>
+        </details>
+        <details style="margin:8px 0;border:1px solid var(--border);border-radius:8px;padding:7px 8px;">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;">游戏改进建议（AI 记录）</summary>
+          <div style="font-size:10px;color:var(--muted);margin:6px 0;">AI 从弹幕中识别出对游戏的具体改进建议时自动记录到这里（同房间 7 天内相同内容只记一条）。</div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;"><button id="sgRefresh" class="ghost" style="padding:5px 8px;">刷新</button><button id="sgClear" class="ghost" style="padding:5px 8px;">清空全部</button></div>
+          <div id="sgResult" style="font-size:10px;color:var(--muted);max-height:220px;overflow:auto;"></div>
+          <div id="sgMsg" style="font-size:10px;color:var(--muted);margin-top:4px;"></div>
         </details>
         <button id="aiDebugOpen" class="ghost" style="width:100%;margin-bottom:6px;">调试 AI 回复（F3）</button>
         <button id="aiSave" style="width:100%;">保存 AI 设置</button><div id="aiMsg" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
@@ -847,13 +855,14 @@ curl -X POST http://${base}/api/webhooks \\
       $('aiEnabled').checked = c.enabled; $('aiBaseUrl').value = c.baseUrl; $('aiModel').value = c.model;
       $('aiKey').placeholder = c.apiKey ? '已保存 API Key；留空保持不变' : 'API Key（保存在本机）';
       $('aiKnowledge').checked = c.knowledgeEnabled !== false;
+      $('aiSuggest').checked = c.suggestionEnabled !== false;
       $('kbDir').value = c.knowledgeDir || 'data/knowledge';
       kbResolvedDir = c.knowledgeDirResolved || '';
       $('aiMaxChars').value = c.replyMaxChars || 180; $('aiMaxRounds').value = c.maxRounds || 3;
       $('aiReplyGap').value = Number(c.replyIntervalMs ?? 3000) / 1000; $('aiDupWindow').value = c.duplicateWindowSec ?? 300;
       $('aiCount').value = c.count; $('aiInterval').value = c.intervalSec;
       try { await loadPrompts(c.promptFile); } catch (e) { $('aiMsg').textContent = `加载提示词失败：${kbErrorText(e)}`; }
-      await loadKnowledgeDocs(); updateAiLogConnection();
+      await loadKnowledgeDocs(); await loadSuggestions(); updateAiLogConnection();
     } catch (e) { $('aiMsg').textContent = `加载 AI 配置失败：${kbErrorText(e)}`; }
   }
   const aiLogStatus = { checking: '判断中', tool: '检索中', skipped: '未回复', sent: '已回复', error: '错误' };
@@ -940,6 +949,41 @@ curl -X POST http://${base}/api/webhooks \\
         : '<div style="color:var(--muted);">没有命中，换几个关键词试试。</div>';
     } catch (e) { $('kbResult').textContent = `检索失败：${kbErrorText(e)}`; }
   };
+  async function loadSuggestions() {
+    try {
+      const j = await kbRequest('/api/ai-chat/suggestions?limit=200');
+      const items = j && Array.isArray(j.suggestions) ? j.suggestions : [];
+      $('sgResult').innerHTML = items.length
+        ? items.map((s) => {
+            const time = new Date(s.ts).toLocaleString();
+            const head = `<b>${escapeHtml(s.category || '其他')}</b> ${escapeHtml(s.player || '匿名')} · ${escapeHtml(time)} · 房间 ${escapeHtml(s.roomId || '')}`;
+            const original = s.original ? `<div style="color:#999;">原文：${escapeHtml(s.original)}</div>` : '';
+            return `<div style="border-top:1px solid #eee;padding:4px 0;">${head} <button class="ghost sg-del" data-id="${s.id}" style="padding:1px 5px;font-size:10px;margin-left:4px;">删除</button><div style="color:#555;white-space:pre-wrap;">${escapeHtml(s.content || '')}</div>${original}</div>`;
+          }).join('')
+        : '<div style="color:var(--muted);">暂无记录。AI 判断弹幕是游戏改进建议时会自动写入。</div>';
+      $('sgResult').querySelectorAll('.sg-del').forEach((btn) => {
+        btn.onclick = async () => {
+          try {
+            await kbRequest(`/api/ai-chat/suggestions/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' });
+            $('sgMsg').textContent = '建议已删除。';
+            await loadSuggestions();
+          } catch (e) { $('sgMsg').textContent = `删除失败：${kbErrorText(e)}`; }
+        };
+      });
+    } catch (e) {
+      $('sgResult').innerHTML = '<div style="color:var(--muted);">加载失败。</div>';
+      $('sgMsg').textContent = `加载建议失败：${kbErrorText(e)}`;
+    }
+  }
+  $('sgRefresh').onclick = () => loadSuggestions();
+  $('sgClear').onclick = async () => {
+    if (!confirm('确定清空所有已记录的游戏改进建议？')) return;
+    try {
+      const j = await kbRequest('/api/ai-chat/suggestions', { method: 'DELETE' });
+      $('sgMsg').textContent = `已清空 ${j && j.removed ? j.removed : 0} 条建议。`;
+      await loadSuggestions();
+    } catch (e) { $('sgMsg').textContent = `清空失败：${kbErrorText(e)}`; }
+  };
   let aiLogStream = null; let aiLogRetry = null;
   function connectAiLogs() {
     if (!$('aiEnabled').checked) { $('aiLogState').textContent = '自动发言未启用'; return; }
@@ -972,7 +1016,7 @@ curl -X POST http://${base}/api/webhooks \\
   };
   $('aiSave').onclick = async () => {
     try {
-      const j = await kbRequest('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, knowledgeEnabled: $('aiKnowledge').checked, knowledgeDir: $('kbDir').value, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), replyMaxChars: Number($('aiMaxChars').value), maxRounds: Number($('aiMaxRounds').value), replyIntervalMs: Number($('aiReplyGap').value) * 1000, duplicateWindowSec: Number($('aiDupWindow').value), promptFile: $('aiPromptFile').value }) });
+      const j = await kbRequest('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, knowledgeEnabled: $('aiKnowledge').checked, suggestionEnabled: $('aiSuggest').checked, knowledgeDir: $('kbDir').value, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), replyMaxChars: Number($('aiMaxChars').value), maxRounds: Number($('aiMaxRounds').value), replyIntervalMs: Number($('aiReplyGap').value) * 1000, duplicateWindowSec: Number($('aiDupWindow').value), promptFile: $('aiPromptFile').value }) });
       $('aiMsg').textContent = '设置已保存；对所有运行中的直播间生效。';
       $('aiKey').value = '';
       $('kbDir').value = j.config.knowledgeDir;

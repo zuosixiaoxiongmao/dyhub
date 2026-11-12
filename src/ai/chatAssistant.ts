@@ -5,6 +5,7 @@ import type { ChatEvent } from '../types/events.js';
 import type { EventBus } from '../pipeline/eventBus.js';
 import type { Collector } from '../collector/collector.js';
 import { DocumentKnowledgeBase, type KnowledgeDoc, type KnowledgeDocMeta, type KnowledgeHit } from './knowledgeBase.js';
+import { SuggestionStore, type SuggestionRecord } from './suggestionStore.js';
 import { runAgent, type AgentMessage, type AgentStep, type AgentTool } from './agent.js';
 
 const DATA_DIR = join(process.cwd(), 'data');
@@ -32,6 +33,8 @@ export interface AiConfig {
   knowledgeDir: string;
   /** 是否允许 Agent 检索文档知识库 */
   knowledgeEnabled: boolean;
+  /** 是否允许 Agent 把弹幕里的游戏改进建议记录到文件 */
+  suggestionEnabled: boolean;
   /** 单轮最多调用几次工具（防止模型无限检索） */
   maxRounds: number;
   /** 单条弹幕回复的最大字符数 */
@@ -115,6 +118,7 @@ const defaults: AiConfig = {
   intervalSec: 20,
   knowledgeDir: process.env.DYHUB_KNOWLEDGE_DIR?.trim() || 'data/knowledge',
   knowledgeEnabled: true,
+  suggestionEnabled: true,
   maxRounds: 3,
   replyMaxChars: 180,
   replyIntervalMs: DEFAULT_REPLY_INTERVAL_MS,
@@ -127,10 +131,11 @@ const AGENT_RULES = `你的职责是解答直播间观众的问题、提供咨�
 工作流程：
 1. 阅读“本轮新弹幕”，判断是否有观众在寻求帮助或咨询（产品、使用方法、价格、优惠、售后、物流、活动规则等）。
 2. 遇到咨询类问题，优先依据用户消息里已附带的“知识库参考”回答；参考不足时再调用 search_knowledge 补充检索，并严格依据检索结果回答；资料没有覆盖时如实说明“这个我不太确定”，不要编造。
-3. 非咨询类内容（闲聊、打招呼、刷屏、无意义表情）一般不需要回复；没有值得处理的咨询或求助时只输出 [SKIP]。
-4. 回答要完整、具体、可直接执行，像真人管理员在弹幕里解答：一般 2-4 句，把关键步骤或条件说清楚。
-5. 不要提及知识库、检索、工具或 AI。
-6. 可能同时有多个观众需要回复：每个需要回复的观众单独一条，不要合并成一条，也不要重复回复同一个人。只输出一个 JSON 对象，键使用“本轮新弹幕”前的编号，值为 {"player_name":"观众昵称","content":"要发送的弹幕正文"}；不要输出代码块、解释或 JSON 以外的文字。没有需要回复的观众时只输出 [SKIP]。
+3. 如果弹幕包含对游戏改进的具体建议（玩法、平衡、数值、功能、操作体验、性能、BUG 等），调用 record_suggestion 记录提炼后的建议；一条建议一次调用，同类建议可合并。记录是后台行为，不需要因此回复观众，也不要提及“已记录”。
+4. 非咨询类内容（闲聊、打招呼、刷屏、无意义表情）一般不需要回复；没有值得处理的咨询、求助或改进建议时只输出 [SKIP]。
+5. 回答要完整、具体、可直接执行，像真人管理员在弹幕里解答：一般 2-4 句，把关键步骤或条件说清楚。
+6. 不要提及知识库、检索、工具或 AI。
+7. 可能同时有多个观众需要回复：每个需要回复的观众单独一条，不要合并成一条，也不要重复回复同一个人。只输出一个 JSON 对象，键使用“本轮新弹幕”前的编号，值为 {"player_name":"观众昵称","content":"要发送的弹幕正文"}；不要输出代码块、解释或 JSON 以外的文字。没有需要回复的观众时只输出 [SKIP]。
 示例：
 {"1":{"player_name":"张三","content":"直接发送宗门名就能加入。"},"2":{"player_name":"李四","content":"月卡 30 元，在商城即可开通。"}}`;
 
@@ -143,6 +148,7 @@ export class ChatAssistant {
   private config = load();
   private knowledgeDir = resolveKnowledgeDir(this.config.knowledgeDir);
   private knowledge = new DocumentKnowledgeBase(this.knowledgeDir);
+  private suggestions = new SuggestionStore();
   private recent = new Map<string, ChatEvent[]>();
   private running = new Set<string>();
   private pending = new Map<string, ChatEvent[]>();
@@ -206,6 +212,7 @@ export class ChatAssistant {
     c.replyIntervalMs = Math.max(0, Math.min(60_000, Math.floor(Number(c.replyIntervalMs) || 0)));
     c.duplicateWindowSec = Math.max(0, Math.min(3600, Math.floor(Number(c.duplicateWindowSec) || 0)));
     c.knowledgeEnabled = input.knowledgeEnabled === undefined ? this.config.knowledgeEnabled : Boolean(input.knowledgeEnabled);
+    c.suggestionEnabled = input.suggestionEnabled === undefined ? this.config.suggestionEnabled : Boolean(input.suggestionEnabled);
     c.knowledgeDir = String(c.knowledgeDir ?? '').trim() || defaults.knowledgeDir;
     c.baseUrl = String(c.baseUrl || defaults.baseUrl).replace(/\/+$/, '');
     c.model = String(c.model || '').trim();
@@ -238,6 +245,11 @@ export class ChatAssistant {
   saveKnowledge(name: string, content: string): KnowledgeDoc { return this.knowledge.save(name, content); }
   removeKnowledge(name: string): boolean { return this.knowledge.remove(name); }
   searchKnowledge(query: string, limit?: number): Promise<KnowledgeHit[]> { return this.knowledge.search(query, limit); }
+
+  // ---- 游戏改进建议（Agent 通过 record_suggestion 工具写入） ----
+  listSuggestions(roomId?: string, limit?: number): SuggestionRecord[] { return this.suggestions.list(roomId, limit); }
+  removeSuggestion(id: number): boolean { return this.suggestions.remove(id); }
+  clearSuggestions(roomId?: string): number { return this.suggestions.clear(roomId); }
 
   /**
    * 过滤重复弹幕：同一批内相同内容只保留第一条，并跳过最近已处理过的相同内容。
@@ -451,7 +463,9 @@ export class ChatAssistant {
       { role: 'system', content: this.buildSystemPrompt(style, c) },
       { role: 'user', content: this.buildUserPrompt(pending, recent, reference) },
     ];
-    const tools = c.knowledgeEnabled ? [this.knowledgeTool()] : [];
+    const tools: AgentTool[] = [];
+    if (c.knowledgeEnabled) tools.push(this.knowledgeTool());
+    if (c.suggestionEnabled) tools.push(this.recordSuggestionTool(pending));
     // 模型可能一次回复多个观众，输出预算随本轮弹幕数增加，避免 JSON 被截断
     const replyBudget = Math.max(1, Math.min(MAX_REPLIES_PER_ROUND, pending.length));
     const llm = {
@@ -462,11 +476,16 @@ export class ChatAssistant {
       maxTokens: Math.min(2400, Math.max(300, c.replyMaxChars * replyBudget + 150)),
     };
     const onToolCall = (step: AgentStep) => {
-      const hits = extractKnowledgeHits(step.result);
-      for (const hit of hits) sources.add(hit.doc);
-      const summary = step.error
-        ? `调用 ${step.tool} 失败：${step.error}`
-        : `检索知识库「${String(step.args.query ?? '')}」：${hits.length ? `命中 ${hits.length} 段（${[...new Set(hits.map((h) => h.doc))].join('、')}）` : '无命中'}`;
+      let summary: string;
+      if (step.tool === 'record_suggestion') {
+        summary = describeSuggestionStep(step);
+      } else {
+        const hits = extractKnowledgeHits(step.result);
+        for (const hit of hits) sources.add(hit.doc);
+        summary = step.error
+          ? `调用 ${step.tool} 失败：${step.error}`
+          : `检索知识库「${String(step.args.query ?? '')}」：${hits.length ? `命中 ${hits.length} 段（${[...new Set(hits.map((h) => h.doc))].join('、')}）` : '无命中'}`;
+      }
       steps.push(summary);
       onStep?.(summary, [...sources], [...steps]);
     };
@@ -625,6 +644,65 @@ ${persona}
             section: hit.heading,
             content: hit.content,
           })),
+        };
+      },
+    };
+  }
+
+  /**
+   * 游戏改进建议工具：模型从弹幕中识别出对游戏的改进建议后调用，
+   * 写入 data/ai-suggestions.json（按房间隔离、内容去重）。
+   */
+  private recordSuggestionTool(pending: ChatEvent[]): AgentTool {
+    return {
+      name: 'record_suggestion',
+      description: '记录观众对游戏改进的具体建议（玩法、平衡、数值、功能、操作体验、性能、BUG 等）。弹幕明确提出可执行的改进点或反馈问题时调用；闲聊、单纯抱怨、咨询不记录。',
+      parameters: {
+        type: 'object',
+        properties: {
+          content: {
+            type: 'string',
+            description: '提炼后的建议：说明现状/问题与期望改进，保留关键细节（如玩法名、数值、操作步骤），不要照抄整句弹幕。',
+          },
+          player: {
+            type: 'string',
+            description: '提出建议的观众昵称；不确定时留空，系统会尝试从弹幕中匹配。',
+          },
+          category: {
+            type: 'string',
+            enum: ['玩法', '平衡', '功能', '体验', '性能', 'bug', '其他'],
+            description: '建议分类。',
+          },
+          original: {
+            type: 'string',
+            description: '原始弹幕内容，便于回溯；可省略。',
+          },
+        },
+        required: ['content'],
+      },
+      execute: async (args, context) => {
+        // 调试面板的模拟弹幕不写入正式建议库
+        if (context.roomId.startsWith('__debug_')) {
+          return { ok: false, skipped: true, reason: '调试模式不记录建议' };
+        }
+        const content = String(args.content ?? '').trim();
+        if (!content) return { ok: false, error: '建议内容为空' };
+        const original = String(args.original ?? '').trim();
+        const player = normalizePlayerName(args.player) || findSuggestionPlayer(pending, original, content);
+        const { added, record } = this.suggestions.add({
+          roomId: context.roomId,
+          player,
+          category: String(args.category ?? ''),
+          content,
+          original: original || undefined,
+        });
+        return {
+          ok: true,
+          added,
+          id: record.id,
+          category: record.category,
+          content: record.content,
+          message: added ? '已记录' : '已有相同建议，未重复记录',
         };
       },
     };
@@ -879,6 +957,40 @@ function extractKnowledgeHits(result: unknown): KnowledgeToolHit[] {
   if (!Array.isArray(results)) return [];
   return results.filter((item): item is KnowledgeToolHit =>
     Boolean(item) && typeof item === 'object' && typeof (item as KnowledgeToolHit).doc === 'string');
+}
+
+/** record_suggestion 工具结果的可读摘要（用于 AI 日志 / 调试面板） */
+function describeSuggestionStep(step: AgentStep): string {
+  if (step.error) return `调用 ${step.tool} 失败：${step.error}`;
+  const result = (step.result && typeof step.result === 'object' ? step.result : null) as
+    { ok?: boolean; added?: boolean; skipped?: boolean; reason?: string; error?: string; content?: string; category?: string } | null;
+  if (result?.skipped) return `未记录建议：${result.reason ?? '已跳过'}`;
+  if (result?.ok === false) return `记录建议失败：${result?.error ?? '未知错误'}`;
+  const text = String(result?.content ?? step.args.content ?? '').trim();
+  const label = result?.category ? `[${result.category}] ` : '';
+  return result?.added === false
+    ? `建议已存在，跳过重复记录：${label}${text}`
+    : `记录游戏改进建议：${label}${text}`;
+}
+
+/** 模型没给昵称时，从本轮弹幕里按原文/内容包含关系反查提出者 */
+function findSuggestionPlayer(pending: ChatEvent[], original: string, content: string): string {
+  const pick = (text: string) => text.trim();
+  const targetOriginal = pick(original);
+  const targetContent = pick(content);
+  for (const ev of pending) {
+    const text = pick(ev.data.content);
+    if (!text) continue;
+    if (targetOriginal ? text === targetOriginal : targetContent.includes(text)) {
+      return normalizePlayerName(ev.user?.nickname);
+    }
+  }
+  if (targetOriginal) {
+    for (const ev of pending) {
+      if (pick(ev.data.content).includes(targetOriginal)) return normalizePlayerName(ev.user?.nickname);
+    }
+  }
+  return '';
 }
 
 /** 清理模型输出：去包裹引号、合并换行、截断到配置长度 */

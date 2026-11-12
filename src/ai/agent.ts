@@ -73,7 +73,7 @@ export interface AgentRunResult {
   rounds: number;
 }
 
-type LlmReply = { content: string | null; toolCalls: AgentToolCall[] };
+type LlmReply = { content: string | null; toolCalls: AgentToolCall[]; finishReason: string };
 
 export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult> {
   const { llm, tools = [], maxRounds = 3, context = { roomId: '' }, signal } = options;
@@ -141,11 +141,28 @@ async function callLlm(
   tools: AgentTool[],
   signal?: AbortSignal,
 ): Promise<LlmReply> {
+  const budget = llm.maxTokens ?? 400;
+  const reply = await requestLlm(llm, messages, tools, signal, budget);
+  // 推理模型会把思维链 token 也计入 max_tokens，预算不足时正文会被截断成半截 JSON。
+  // 检测到 finish_reason=length 时放大预算重试一次，避免整轮回复丢失。
+  if (reply.finishReason !== 'length') return reply;
+  const retryBudget = Math.min(8000, Math.max(budget * 2, 1200));
+  if (retryBudget <= budget) return reply;
+  return requestLlm(llm, messages, tools, signal, retryBudget);
+}
+
+async function requestLlm(
+  llm: AgentLlmConfig,
+  messages: AgentMessage[],
+  tools: AgentTool[],
+  signal: AbortSignal | undefined,
+  maxTokens: number,
+): Promise<LlmReply> {
   const body: Record<string, unknown> = {
     model: llm.model,
     messages,
     temperature: llm.temperature ?? 0.6,
-    max_tokens: llm.maxTokens ?? 400,
+    max_tokens: maxTokens,
   };
   if (tools.length) {
     body.tools = tools.map((tool) => ({
@@ -166,8 +183,10 @@ async function callLlm(
   }
 
   const data: any = await response.json();
-  const message = data?.choices?.[0]?.message;
+  const choice = data?.choices?.[0];
+  const message = choice?.message;
   if (!message) throw new Error('LLM 返回格式异常：缺少 choices[0].message');
+  const finishReason = String(choice?.finish_reason ?? '');
 
   const content = typeof message.content === 'string'
     ? message.content
@@ -187,7 +206,7 @@ async function callLlm(
     },
   }));
 
-  return { content, toolCalls };
+  return { content, toolCalls, finishReason };
 }
 
 function parseArguments(raw: string): Record<string, unknown> {

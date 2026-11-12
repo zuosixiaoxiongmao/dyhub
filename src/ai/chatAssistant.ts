@@ -136,7 +136,7 @@ const AGENT_RULES = `你的职责是解答直播间观众的问题、提供咨�
 5. 非咨询类内容（闲聊、打招呼、刷屏、无意义表情）一般不需要回复；没有值得处理的咨询、求助或改进建议时只输出 [SKIP]。
 6. 回答要具体、可直接执行；具体篇幅、语气和话术以人设文件为准。
 7. 不要提及知识库、检索、工具或 AI。
-8. 可能同时有多个观众需要回复：每个需要回复的观众单独一条，不要合并成一条，也不要重复回复同一个人。只输出一个 JSON 对象，键使用“本轮新弹幕”前的编号，值为 {"player_name":"观众昵称","content":"要发送的弹幕正文"}；不要输出代码块、解释或 JSON 以外的文字。没有需要回复的观众时只输出 [SKIP]。
+8. 可能同时有多个观众需要回复：每条需要回答的弹幕单独输出一条。同一位观众提了多个不同问题时，必须逐条全部回答，不能只答其中一条，也不要为了省事把多个问题合并后漏掉内容；完全相同的内容只输出一次。只输出一个 JSON 对象，键使用“本轮新弹幕”前的编号，值为 {"player_name":"观众昵称","content":"要发送的弹幕正文"}；不要输出代码块、解释或 JSON 以外的文字。没有需要回复的观众时只输出 [SKIP]。
 示例：
 {"1":{"player_name":"张三","content":"直接发送宗门名就能加入。"},"2":{"player_name":"李四","content":"月卡 30 元，在商城即可开通。"}}`;
 
@@ -147,8 +147,8 @@ function save(c: AiConfig) { mkdirSync(join(process.cwd(), 'data'), { recursive:
 
 export class ChatAssistant {
   private config = load();
-  private knowledgeDir = resolveKnowledgeDir(this.config.knowledgeDir);
-  private knowledge = new DocumentKnowledgeBase(this.knowledgeDir);
+  private knowledgeDir!: string;
+  private knowledge!: DocumentKnowledgeBase;
   private suggestions = new SuggestionStore();
   private recent = new Map<string, ChatEvent[]>();
   private running = new Set<string>();
@@ -161,6 +161,18 @@ export class ChatAssistant {
   private listeners = new Set<(log: AiLog) => void>();
   private subscription: number;
   constructor(private bus: EventBus, private collector: Collector) {
+    // 知识库目录不可用（例如从另一台机器带过来的绝对路径、盘符不存在）时
+    // 回退到默认目录，不能让一个可选功能拖垮整个采集服务。
+    const requestedDir = resolveKnowledgeDir(this.config.knowledgeDir);
+    try {
+      this.knowledge = new DocumentKnowledgeBase(requestedDir);
+      this.knowledgeDir = requestedDir;
+    } catch (e) {
+      const fallbackDir = resolveKnowledgeDir(defaults.knowledgeDir);
+      this.knowledge = new DocumentKnowledgeBase(fallbackDir);
+      this.knowledgeDir = fallbackDir;
+      console.warn(`[dyhub] 知识库目录不可用（${requestedDir}）：${e instanceof Error ? e.message : String(e)}；已回退到 ${fallbackDir}`);
+    }
     mkdirSync(PROMPT_DIR, { recursive: true });
     const legacy = load() as AiConfig & { systemPrompt?: string };
     if (legacy.systemPrompt && !existsSync(join(PROMPT_DIR, defaults.promptFile))) {
@@ -302,6 +314,40 @@ export class ChatAssistant {
     }
   }
 
+  /**
+   * 构建发给模型的“最近弹幕上下文”：
+   * - 已处理 / 已回复过的内容（handledChats）直接排除，不再请求模型；
+   * - 与本轮新弹幕相同的内容排除，避免模型把新问题当成历史问题；
+   * - 上下文内部相同内容只保留最新一条。
+   * 返回空数组是合法的，表示本轮没有可参考的历史语境。
+   */
+  private buildRecentContext(roomId: string, fresh: ChatEvent[]): ChatEvent[] {
+    const now = Date.now();
+    const handled = this.handledChats.get(roomId);
+    const isHandled = (key: string): boolean => {
+      const expiresAt = handled?.get(key);
+      return expiresAt !== undefined && expiresAt > now;
+    };
+    const freshKeys = new Set<string>();
+    for (const ev of fresh) {
+      const key = chatSignature(ev.data.content);
+      if (key) freshKeys.add(key);
+    }
+
+    const kept: ChatEvent[] = [];
+    const seen = new Set<string>();
+    const recent = this.recent.get(roomId) ?? [];
+    // 从新到旧扫描，同一内容只保留最新一条
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const ev = recent[i];
+      const key = chatSignature(ev.data.content);
+      if (!key || isHandled(key) || freshKeys.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      kept.push(ev);
+    }
+    return kept.reverse().slice(-this.config.count);
+  }
+
   private schedule(roomId: string) {
     if (this.timers.has(roomId)) return;
     const timer = setTimeout(() => {
@@ -339,8 +385,9 @@ export class ChatAssistant {
       this.log({ roomId, status: 'tool', inputCount: batch.length, message: `已忽略 ${duplicates} 条重复/近期已处理的弹幕` });
     }
 
-    const recent = (this.recent.get(roomId) ?? []).slice(-c.count);
-    if (!recent.length) return;
+    // 上下文只保留“还没处理过、且不与本轮新弹幕重复”的弹幕：
+    // 已回复过的内容不再塞给模型，避免同一问题被反复理解或当作已解决而跳过。
+    const recent = this.buildRecentContext(roomId, fresh);
 
     this.running.add(roomId);
     this.log({ roomId, status: 'checking', inputCount: batch.length, message: `正在判断最近 ${recent.length} 条弹幕（本轮新弹幕 ${fresh.length} 条）` });
@@ -467,14 +514,17 @@ export class ChatAssistant {
     const tools: AgentTool[] = [];
     if (c.knowledgeEnabled) tools.push(this.knowledgeTool());
     if (c.suggestionEnabled) tools.push(this.recordSuggestionTool(pending));
-    // 模型可能一次回复多个观众，输出预算随本轮弹幕数增加，避免 JSON 被截断
+    // 模型可能一次回复多个观众，输出预算随本轮弹幕数增加，避免 JSON 被截断。
+    // 推理模型（如 deepseek-flash / reasoner）的思维链 token 也计入 max_tokens，
+    // 预算里必须留出这部分，否则正文会被截在半截、JSON 解析失败后整轮被判为无回复。
     const replyBudget = Math.max(1, Math.min(MAX_REPLIES_PER_ROUND, pending.length));
+    const REASONING_HEADROOM = 800;
     const llm = {
       baseUrl: c.baseUrl,
       apiKey: c.apiKey,
       model: c.model,
       temperature: 0.7,
-      maxTokens: Math.min(2400, Math.max(300, c.replyMaxChars * replyBudget + 150)),
+      maxTokens: Math.min(4000, Math.max(800, c.replyMaxChars * replyBudget + REASONING_HEADROOM)),
     };
     const onToolCall = (step: AgentStep) => {
       let summary: string;
@@ -593,12 +643,12 @@ ${persona}
     const newLines = pending.slice(-30).map((ev, index) => `${index + 1}. ${format(ev)}`).join('\n');
     const contextLines = recent.slice(-30).map(format).join('\n');
     const context = contextLines
-      ? `\n\n最近弹幕上下文（仅供理解语境，不要重复回答已在上下文里解决过的问题）：\n${contextLines}`
+      ? `\n\n最近弹幕上下文（已回复过的弹幕已排除；仅供理解语境，不要重复回答）：\n${contextLines}`
       : '';
     const knowledge = reference
       ? `\n\n知识库参考（系统按本轮弹幕自动检索，可能包含无关内容；只在观众确实咨询时使用，回答时不要提及“知识库”或检索过程）：\n${reference}`
       : '';
-    return `本轮新弹幕（优先处理，只回答其中尚未得到解答的问题；编号用于输出 JSON 的键）：\n${newLines}${context}${knowledge}\n\n请判断本轮是否有观众需要帮助/咨询；优先依据“知识库参考”回答，参考不足时再调用 search_knowledge 补充检索。每个需要回复的观众单独输出一条，按系统提示的 JSON 格式返回；没有值得回复的内容只输出 [SKIP]。`;
+    return `本轮新弹幕（优先处理；编号用于输出 JSON 的键）：\n${newLines}${context}${knowledge}\n\n请判断本轮是否有观众需要帮助/咨询；优先依据“知识库参考”回答，参考不足时再调用 search_knowledge 补充检索。每条需要回答的弹幕单独输出一条；同一位观众提了多个问题时逐个回答，不要漏答，也不要重复回答同一个问题。按系统提示的 JSON 格式返回；没有值得回复的内容只输出 [SKIP]。`;
   }
 
   /** 按本轮弹幕逐条本地检索，去重后取少量片段；单条检索失败不影响其他弹幕 */
@@ -779,7 +829,9 @@ function parseReplies(raw: string, pending: ChatEvent[], maxChars: number): Pars
     }
     const content = sanitizeReply(entry.content, maxChars);
     if (!content) continue;
-    const key = player ? `p:${player}` : `c:${content}`;
+    // 按“观众 + 内容”去重：同一观众的不同问题要分别保留，只有完全相同的内容才丢弃。
+    // 不能只按玩家去重，否则同一个人连问两个问题时会静默丢掉后一条回复。
+    const key = `${player} ${chatSignature(content)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     replies.push({ player, content });

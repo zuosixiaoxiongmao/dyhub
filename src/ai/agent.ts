@@ -64,6 +64,11 @@ export interface AgentRunOptions {
   onToolCall?: (step: AgentStep) => void;
   /** 每轮 LLM 调用前回调 */
   onRound?: (round: number) => void;
+  /**
+   * 首轮工具结果回填后调用一次，返回需要追加到对话的消息。
+   * 用于在第二次 LLM 请求前附上回答规范等上下文；只在模型确实调用过工具时触发。
+   */
+  afterTools?: () => AgentMessage[] | undefined;
 }
 
 export interface AgentRunResult {
@@ -81,6 +86,7 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   const steps: AgentStep[] = [];
   let rounds = 0;
+  let afterToolsAdded = false;
 
   while (rounds < maxRounds) {
     rounds++;
@@ -120,6 +126,13 @@ export async function runAgent(options: AgentRunOptions): Promise<AgentRunResult
         tool_call_id: call.id,
         content: payload.slice(0, 12_000),
       });
+    }
+
+    // 第一次工具结果回填后，把回答规范等上下文附加到第二次请求里；只追加一次。
+    if (!afterToolsAdded && options.afterTools) {
+      afterToolsAdded = true;
+      const extra = options.afterTools();
+      if (extra?.length) messages.push(...extra);
     }
   }
 

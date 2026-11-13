@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import type { ChatEvent } from '../types/events.js';
 import type { EventBus } from '../pipeline/eventBus.js';
 import type { Collector } from '../collector/collector.js';
+import type { RoomMeta } from '../collector/roomMeta.js';
 import { DocumentKnowledgeBase, type KnowledgeDoc, type KnowledgeDocMeta, type KnowledgeHit } from './knowledgeBase.js';
 import { runAgent, type AgentMessage, type AgentStep, type AgentTool } from './agent.js';
 
@@ -13,11 +14,12 @@ const PROMPT_DIR = join(DATA_DIR, 'prompts');
 const LEGACY_DEFAULT_PROMPT = '你是直播间的一名普通观众。根据最近的观众弹幕，自然地参与聊天。只输出一句简短中文弹幕，不要引号、解释或扮演主播。';
 const DEFAULT_PROMPT = '你是本直播间的管理员兼咨询助手，语气自然、专业、有耐心，像真人管理员在弹幕里回复观众。';
 
-/** 工具调用结果的形状（search_knowledge 的返回值） */
-interface KnowledgeToolHit {
-  doc: string;
-  section?: string;
-  content: string;
+/** read_knowledge 返回的单篇文档 */
+interface KnowledgeDocResult {
+  name: string;
+  content?: string;
+  truncated?: boolean;
+  error?: string;
 }
 
 export interface AiConfig {
@@ -105,6 +107,21 @@ const DEFAULT_REPLY_INTERVAL_MS = (() => {
 /** 单轮最多回复多少个观众，防止模型输出过多条目刷屏 */
 const MAX_REPLIES_PER_ROUND = 10;
 
+// ---- 知识库索引 / 文档读取 ----
+/** README 索引文件名：列出每个知识文档的书名与关键字，第一次请求时附带 */
+const KNOWLEDGE_INDEX_NAME = 'README.md';
+/** 回答规范文件名：模型读取文档后，第二次请求时附带 */
+const KNOWLEDGE_RULES_NAME = '00-回答规范.md';
+/** 一次工具调用最多读取几篇文档 */
+const MAX_DOCS_PER_READ = 4;
+/** 单篇文档注入提示词的最大字符数 */
+const MAX_DOC_READ_CHARS = 4000;
+/** 一次工具调用注入的文档总字符预算（agent.ts 会把工具结果截断到 12000 字符，留出 JSON 转义余量） */
+const MAX_DOC_READ_TOTAL_CHARS = 10_000;
+/** README 索引与回答规范的最大字符数 */
+const MAX_INDEX_CHARS = 4000;
+const MAX_RULES_CHARS = 4000;
+
 const defaults: AiConfig = {
   enabled: false,
   count: 10,
@@ -126,8 +143,8 @@ const AGENT_RULES = `你的职责是解答直播间观众的问题、提供咨�
 
 工作流程：
 1. 阅读“本轮新弹幕”，判断是否有观众在寻求帮助或咨询（产品、使用方法、价格、优惠、售后、物流、活动规则等）。
-2. 遇到咨询类问题，优先依据用户消息里已附带的“知识库参考”回答；参考不足时再调用 search_knowledge 补充检索，并严格依据检索结果回答；资料没有覆盖时如实说明“这个我不太确定”，不要编造。
-3. 非咨询类内容（闲聊、打招呼、刷屏、无意义表情）一般不需要回复；没有值得处理的咨询或求助时只输出 [SKIP]。
+2. 遇到咨询类问题，先阅读用户消息里附带的“知识库索引”（README.md，列出每篇文档的书名与关键字），从中挑出与问题相关的文档，调用 read_knowledge 读取完整内容；只读相关文档，不要凭索引猜测答案。系统会在读取成功后附上“回答规范”，必须按规范作答，并严格依据文档内容；资料没有覆盖时如实说明“这个我不太确定”，不要编造。
+3. 非咨询类内容（闲聊、打招呼、刷屏、无意义表情）一般不需要回复，也不要读取文档；没有值得处理的咨询或求助时只输出 [SKIP]。
 4. 回答要完整、具体、可直接执行，像真人管理员在弹幕里解答：一般 2-4 句，把关键步骤或条件说清楚。
 5. 不要提及知识库、检索、工具或 AI。
 6. 可能同时有多个观众需要回复：每个需要回复的观众单独一条，不要合并成一条，也不要重复回复同一个人。只输出一个 JSON 对象，键使用“本轮新弹幕”前的编号，值为 {"player_name":"观众昵称","content":"要发送的弹幕正文"}；不要输出代码块、解释或 JSON 以外的文字。没有需要回复的观众时只输出 [SKIP]。
@@ -168,6 +185,8 @@ export class ChatAssistant {
     this.config = { ...this.config, promptFile: this.safePromptName(legacy.promptFile) || defaults.promptFile };
     this.subscription = bus.subscribe({ type: 'chat' }, (ev) => {
       if (ev.type !== 'chat' || !ev.data.content.trim() || !this.config.enabled) return;
+      // 主播自己的发言不进入 AI 上下文，也不触发回复，避免直播间出现“主播自答自话”
+      if (isAnchorChatEvent(ev, this.collector.getRoomInfo(ev.roomId)?.meta)) return;
       const list = this.recent.get(ev.roomId) ?? [];
       list.push(ev); if (list.length > 100) list.shift(); this.recent.set(ev.roomId, list);
       const pending = this.pending.get(ev.roomId) ?? [];
@@ -304,8 +323,23 @@ export class ChatAssistant {
     // 上一轮（可能正在逐条发送多个观众）还没结束时不要清空 pending；
     // 等本轮结束会在 finally 里自动补排下一轮。
     if (this.running.has(roomId)) return;
-    const batch = this.pending.get(roomId) ?? [];
-    if (!batch.length) return;
+    const original = this.pending.get(roomId) ?? [];
+    if (!original.length) return;
+    // 主播信息是异步补全的：入队时可能还不知道谁是主播，这里在开口前再过滤一次
+    const meta = this.collector.getRoomInfo(roomId)?.meta;
+    const batch = meta ? original.filter((ev) => !isAnchorChatEvent(ev, meta)) : original;
+    const anchorCount = original.length - batch.length;
+    if (!batch.length) {
+      this.pending.delete(roomId);
+      this.log({
+        roomId, status: 'skipped', inputCount: original.length,
+        message: `本轮 ${anchorCount} 条弹幕来自主播本人，已忽略`,
+      });
+      return;
+    }
+    if (anchorCount) {
+      this.log({ roomId, status: 'tool', inputCount: original.length, message: `已忽略 ${anchorCount} 条主播本人弹幕` });
+    }
     if (!c.apiKey || !c.model) {
       this.pending.delete(roomId);
       this.log({ roomId, status: 'error', inputCount: batch.length, message: '请配置 API Key 和模型' });
@@ -326,7 +360,9 @@ export class ChatAssistant {
       this.log({ roomId, status: 'tool', inputCount: batch.length, message: `已忽略 ${duplicates} 条重复/近期已处理的弹幕` });
     }
 
-    const recent = (this.recent.get(roomId) ?? []).slice(-c.count);
+    const recent = (this.recent.get(roomId) ?? [])
+      .filter((ev) => !meta || !isAnchorChatEvent(ev, meta))
+      .slice(-c.count);
     if (!recent.length) return;
 
     this.running.add(roomId);
@@ -411,7 +447,8 @@ export class ChatAssistant {
   }
 
   /**
-   * 生成回复的核心流程：预检索 → 构建提示词 → Agent（含工具）→ 清洗输出。
+   * 生成回复的核心流程：附带 README 索引 → Agent 按需读取文档 →
+   * 第二次请求附文档 + 回答规范 → 清洗输出。
    * 正式发言与调试面板共用，区别只在于调用方是否把结果发送到直播间。
    */
   private async composeReply(
@@ -426,32 +463,34 @@ export class ChatAssistant {
     const promptPath = join(PROMPT_DIR, c.promptFile);
     const style = existsSync(promptPath) ? readFileSync(promptPath, 'utf8') : DEFAULT_PROMPT;
 
-    // 先按本轮弹幕做一次本地预检索。这样即使模型不支持 function calling
-    // （或者选择不调用工具），提示词里也已经带着知识库内容，不会出现
-    // “文档写好了但 AI 完全没用上”的情况。模型仍可在参考不足时调用工具。
-    let reference = '';
-    if (c.knowledgeEnabled) {
-      try {
-        const prefetched = await this.prefetchKnowledge(pending);
-        if (prefetched.length) {
-          reference = formatKnowledgeSnippets(prefetched);
-          for (const hit of prefetched) sources.add(hit.doc);
-          const docs = [...new Set(prefetched.map((hit) => hit.doc))].join('、');
-          const summary = `预检索知识库：命中 ${prefetched.length} 段（${docs}）`;
-          steps.push(summary);
-          onStep?.(summary, [...sources], [...steps]);
-        }
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        steps.push(`预检索知识库失败：${message}`);
-      }
+    // 知识库采用「索引 → 读文档 → 回答」两段式，避免每轮把全部知识塞进提示词：
+    // 第一次请求只附带 README.md（每篇文档的书名 + 关键字），模型按需调用
+    // read_knowledge 读取相关文档；第二次请求再把文档和 00-回答规范.md 一起附上。
+    const docNames = c.knowledgeEnabled ? this.knowledge.list().map((doc) => doc.name) : [];
+    const hasReadableDocs = docNames.some((name) => !isSpecialKnowledgeDoc(name));
+    const indexDoc = hasReadableDocs ? this.loadKnowledgeIndex(docNames) : null;
+    const rules = hasReadableDocs ? this.loadKnowledgeRules(docNames) : null;
+    if (indexDoc) {
+      const summary = indexDoc.name
+        ? `已附带知识库索引 ${indexDoc.name}`
+        : `未找到 ${KNOWLEDGE_INDEX_NAME}，已自动生成知识库索引（${indexDoc.count} 篇文档）`;
+      steps.push(summary);
+      onStep?.(summary, [...sources], [...steps]);
+    }
+    if (c.knowledgeEnabled && !hasReadableDocs) {
+      const summary = '知识库目录没有可用文档，本轮不附带索引';
+      steps.push(summary);
+      onStep?.(summary, [...sources], [...steps]);
+    } else if (c.knowledgeEnabled && !rules) {
+      steps.push(`未找到回答规范 ${KNOWLEDGE_RULES_NAME}，将按系统提示直接作答`);
     }
 
+    const tools: AgentTool[] = [];
+    if (indexDoc) tools.push(this.readKnowledgeTool(docNames));
     const messages: AgentMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(style, c) },
-      { role: 'user', content: this.buildUserPrompt(pending, recent, reference) },
+      { role: 'user', content: this.buildUserPrompt(pending, recent, indexDoc?.content ?? '', tools.length > 0) },
     ];
-    const tools = c.knowledgeEnabled ? [this.knowledgeTool()] : [];
     // 模型可能一次回复多个观众，输出预算随本轮弹幕数增加，避免 JSON 被截断
     const replyBudget = Math.max(1, Math.min(MAX_REPLIES_PER_ROUND, pending.length));
     const llm = {
@@ -462,26 +501,66 @@ export class ChatAssistant {
       maxTokens: Math.min(2400, Math.max(300, c.replyMaxChars * replyBudget + 150)),
     };
     const onToolCall = (step: AgentStep) => {
-      const hits = extractKnowledgeHits(step.result);
-      for (const hit of hits) sources.add(hit.doc);
+      const docs = extractKnowledgeDocs(step.result);
+      const loaded = docs.filter((doc) => doc.content);
+      for (const doc of loaded) sources.add(doc.name);
+      const failed = docs.length - loaded.length;
       const summary = step.error
         ? `调用 ${step.tool} 失败：${step.error}`
-        : `检索知识库「${String(step.args.query ?? '')}」：${hits.length ? `命中 ${hits.length} 段（${[...new Set(hits.map((h) => h.doc))].join('、')}）` : '无命中'}`;
+        : loaded.length
+          ? `读取知识文档：${loaded.map((doc) => doc.name).join('、')}${failed ? `（${failed} 篇失败）` : ''}`
+          : `调用 ${step.tool} 未读到有效文档`;
       steps.push(summary);
       onStep?.(summary, [...sources], [...steps]);
     };
+    // 工具结果回填后、第二次请求前附上回答规范
+    const afterTools = rules
+      ? () => {
+        const summary = `已附带回答规范 ${rules.name}`;
+        steps.push(summary);
+        onStep?.(summary, [...sources], [...steps]);
+        return [{
+          role: 'user' as const,
+          content: `回答规范（来自知识库 ${rules.name}，生成回复时必须遵守）：\n${rules.content}`,
+        }];
+      }
+      : undefined;
     let result: Awaited<ReturnType<typeof runAgent>>;
     try {
-      result = await runAgent({ llm, messages, tools, maxRounds: c.maxRounds, context: { roomId }, onToolCall });
+      result = await runAgent({ llm, messages, tools, maxRounds: c.maxRounds, context: { roomId }, onToolCall, afterTools });
     } catch (e) {
       // 有些 OpenAI 兼容服务不支持 tools / function calling，会直接返回 400。
-      // 此时退回“只用预检索资料 + 普通对话”的一次调用，保证知识库仍然生效。
+      // 此时退回“本地检索资料 + 回答规范 + 普通对话”的一次调用，保证知识库仍然生效。
       if (!tools.length || !isToolCapabilityError(e)) throw e;
       const message = e instanceof Error ? e.message : String(e);
-      const summary = `模型不支持工具调用（${message.slice(0, 80)}），改用预检索资料直接回答`;
+      let reference = '';
+      if (c.knowledgeEnabled) {
+        try {
+          const prefetched = await this.prefetchKnowledge(pending);
+          if (prefetched.length) {
+            reference = formatKnowledgeSnippets(prefetched);
+            for (const hit of prefetched) sources.add(hit.doc);
+          }
+        } catch { /* 本地检索失败时仍可基于回答规范作答 */ }
+      }
+      const summary = `模型不支持工具调用（${message.slice(0, 80)}），改用本地检索资料直接回答`;
       steps.push(summary);
       onStep?.(summary, [...sources], [...steps]);
-      result = await runAgent({ llm, messages, tools: [], maxRounds: 1, context: { roomId } });
+      const fallback = [
+        this.buildUserPrompt(pending, recent, '', false),
+        reference ? `\n\n知识库参考（系统按本轮弹幕自动检索，只在观众确实咨询时使用）：\n${reference}` : '',
+        rules ? `\n\n回答规范（来自知识库 ${rules.name}，必须遵守）：\n${rules.content}` : '',
+      ].join('');
+      result = await runAgent({
+        llm,
+        messages: [
+          { role: 'system', content: this.buildSystemPrompt(style, c) },
+          { role: 'user', content: fallback },
+        ],
+        tools: [],
+        maxRounds: 1,
+        context: { roomId },
+      });
     }
 
     const raw = result.content.trim();
@@ -498,8 +577,8 @@ export class ChatAssistant {
   }
 
   /**
-   * 调试面板入口：模拟一条或多条观众弹幕，走完知识库预检索、Agent（含工具调用）
-   * 和回复清洗，但不发送到直播间，也不写入正式 AI 日志。
+   * 调试面板入口：模拟一条或多条观众弹幕，走完 README 索引、文档读取、
+   * 回答规范注入和回复清洗，但不发送到直播间，也不写入正式 AI 日志。
    * 多行输入时每行按「昵称：弹幕」拆分；没有冒号的行按“测试观众”处理。
    */
   async testReply(text: string): Promise<AiDebugReply> {
@@ -567,7 +646,7 @@ ${persona}
 单条回复不超过 ${c.replyMaxChars} 个字符。${c.knowledgeEnabled ? '' : '\n当前知识库检索已关闭，不要编造资料；拿不准的问题请如实说明或回复 [SKIP]。'}`;
   }
 
-  private buildUserPrompt(pending: ChatEvent[], recent: ChatEvent[], reference = ''): string {
+  private buildUserPrompt(pending: ChatEvent[], recent: ChatEvent[], knowledgeIndex = '', allowTools = true): string {
     const format = (ev: ChatEvent) => `${ev.user?.nickname || '观众'}：${ev.data.content}`;
     // 编号与 parseReplies 的索引回退保持一致：模型没给 player_name 时可用编号定位观众
     const newLines = pending.slice(-30).map((ev, index) => `${index + 1}. ${format(ev)}`).join('\n');
@@ -575,10 +654,13 @@ ${persona}
     const context = contextLines
       ? `\n\n最近弹幕上下文（仅供理解语境，不要重复回答已在上下文里解决过的问题）：\n${contextLines}`
       : '';
-    const knowledge = reference
-      ? `\n\n知识库参考（系统按本轮弹幕自动检索，可能包含无关内容；只在观众确实咨询时使用，回答时不要提及“知识库”或检索过程）：\n${reference}`
+    const knowledge = knowledgeIndex
+      ? `\n\n知识库索引（每篇文档的书名与关键字；只在观众咨询时从中挑选相关文档，不要读取无关文档）：\n${knowledgeIndex}`
       : '';
-    return `本轮新弹幕（优先处理，只回答其中尚未得到解答的问题；编号用于输出 JSON 的键）：\n${newLines}${context}${knowledge}\n\n请判断本轮是否有观众需要帮助/咨询；优先依据“知识库参考”回答，参考不足时再调用 search_knowledge 补充检索。每个需要回复的观众单独输出一条，按系统提示的 JSON 格式返回；没有值得回复的内容只输出 [SKIP]。`;
+    const instruction = allowTools
+      ? '请判断本轮是否有观众需要帮助/咨询；涉及咨询时，先从“知识库索引”中挑选相关文档并调用 read_knowledge 读取全文，再依据文档内容和系统随后附上的“回答规范”作答；索引里没有相关文档或资料不足时如实说明不确定，不要编造。'
+      : '请判断本轮是否有观众需要帮助/咨询；涉及咨询时优先依据“知识库参考”和“回答规范”作答，资料不足时如实说明不确定，不要编造。';
+    return `本轮新弹幕（优先处理，只回答其中尚未得到解答的问题；编号用于输出 JSON 的键）：\n${newLines}${context}${knowledge}\n\n${instruction}每个需要回复的观众单独输出一条，按系统提示的 JSON 格式返回；没有值得回复的内容只输出 [SKIP]。`;
   }
 
   /** 按本轮弹幕逐条本地检索，去重后取少量片段；单条检索失败不影响其他弹幕 */
@@ -590,6 +672,8 @@ ${persona}
       if (!text || !looksLikeQuestion(text)) continue;
       let found: KnowledgeHit[];
       try { found = await this.knowledge.search(text, 2); } catch { continue; }
+      // 索引和回答规范不是知识内容，降级检索时排除
+      found = found.filter((hit) => !isSpecialKnowledgeDoc(hit.doc));
       for (const hit of found) {
         const key = `${hit.doc}\u0000${hit.heading ?? ''}\u0000${hit.content.slice(0, 60)}`;
         if (seen.has(key)) continue;
@@ -601,31 +685,95 @@ ${persona}
     return hits;
   }
 
-  private knowledgeTool(): AgentTool {
+  /** 读取 README.md 索引；缺失时按实际文档名自动生成一个最小索引 */
+  private loadKnowledgeIndex(names: string[]): { name?: string; content: string; count: number } | null {
+    const indexName = names.find((name) => name.toLowerCase() === KNOWLEDGE_INDEX_NAME.toLowerCase());
+    if (indexName) {
+      try {
+        const content = this.knowledge.get(indexName).content.trim();
+        if (content) return { name: indexName, content: clipText(content, MAX_INDEX_CHARS), count: names.length };
+      } catch { /* 读取失败时退回自动索引 */ }
+    }
+    const docs = names.filter((name) => !isSpecialKnowledgeDoc(name));
+    if (!docs.length) return null;
+    const listed = docs.slice(0, 50).map((name) => `- ${name}`);
+    const rest = docs.length > listed.length ? `\n…还有 ${docs.length - listed.length} 篇未列出，请补全 ${KNOWLEDGE_INDEX_NAME}` : '';
     return {
-      name: 'search_knowledge',
-      description: '检索直播间知识库（产品资料、使用方法、价格、售后、物流、活动规则等）。当观众提出咨询或求助时调用；回答必须基于返回内容，不得编造。',
+      content: clipText(`可用知识文档（未找到 ${KNOWLEDGE_INDEX_NAME}，以下为文件名）：\n${listed.join('\n')}${rest}`, MAX_INDEX_CHARS),
+      count: docs.length,
+    };
+  }
+
+  /** 读取回答规范；模型读取文档后、第二次请求前附加 */
+  private loadKnowledgeRules(names: string[]): { name: string; content: string } | null {
+    const name = names.find((item) => item.toLowerCase() === KNOWLEDGE_RULES_NAME.toLowerCase());
+    if (!name) return null;
+    try {
+      const content = this.knowledge.get(name).content.trim();
+      return content ? { name, content: clipText(content, MAX_RULES_CHARS) } : null;
+    } catch { return null; }
+  }
+
+  /** 按 README 索引读取完整知识文档的 Agent 工具 */
+  private readKnowledgeTool(names: string[]): AgentTool {
+    return {
+      name: 'read_knowledge',
+      description: `按知识库索引读取完整文档。当观众咨询或求助、且索引中有相关文档时调用；文档名必须是索引里出现的文件名，一次最多 ${MAX_DOCS_PER_READ} 篇，只读与问题相关的文档。`,
       parameters: {
         type: 'object',
         properties: {
-          query: {
-            type: 'string',
-            description: '检索关键词。保留观众问题中的名词和动作，例如「退款 流程」「会员 价格」「怎么连接设备」。',
+          names: {
+            type: 'array',
+            items: { type: 'string' },
+            description: `要读取的文档名，来自“知识库索引”，例如 ["07-玩家常见问题.md"]；一次最多 ${MAX_DOCS_PER_READ} 篇。`,
           },
         },
-        required: ['query'],
+        required: ['names'],
       },
       execute: async (args) => {
-        const query = String(args.query ?? '').trim();
-        if (!query) return { results: [] };
-        const hits = await this.knowledge.search(query, 4);
-        return {
-          results: hits.map((hit): KnowledgeToolHit => ({
-            doc: hit.doc,
-            section: hit.heading,
-            content: hit.content,
-          })),
-        };
+        const requested = Array.isArray(args.names)
+          ? args.names.map((item) => String(item ?? ''))
+          : typeof args.names === 'string'
+            ? [args.names]
+            : typeof args.name === 'string' // 兼容模型把数组写成单个 name 的情况
+              ? [args.name]
+              : [];
+        const documents: KnowledgeDocResult[] = [];
+        const seen = new Set<string>();
+        let loaded = 0;
+        let budget = MAX_DOC_READ_TOTAL_CHARS;
+        for (const raw of requested.slice(0, MAX_DOCS_PER_READ * 2)) {
+          if (loaded >= MAX_DOCS_PER_READ || budget <= 0) break;
+          const requestedName = raw.trim();
+          const name = resolveKnowledgeDocName(requestedName, names);
+          if (!name) {
+            documents.push({ name: requestedName, error: '文档不存在，请从知识库索引中选择文件名' });
+            continue;
+          }
+          if (isSpecialKnowledgeDoc(name)) {
+            documents.push({ name, error: '索引与回答规范无需读取' });
+            continue;
+          }
+          if (seen.has(name)) continue;
+          seen.add(name);
+          try {
+            const content = this.knowledge.get(name).content.trim();
+            if (!content) {
+              documents.push({ name, error: '文档内容为空' });
+              continue;
+            }
+            const take = Math.min(MAX_DOC_READ_CHARS, budget);
+            const truncated = content.length > take;
+            const body = truncated ? `${content.slice(0, take)}\n…（文档过长，已截断）` : content;
+            budget = Math.max(0, budget - body.length);
+            loaded++;
+            documents.push({ name, content: body, ...(truncated ? { truncated: true } : {}) });
+          } catch (e) {
+            documents.push({ name, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        if (!documents.length) return { documents: [], error: '没有可读取的文档，请检查知识库索引中的文件名' };
+        return { documents };
       },
     };
   }
@@ -819,6 +967,21 @@ function normalizePlayerName(value: unknown): string {
 }
 
 /**
+ * 判断一条弹幕是否来自直播间主播本人。
+ * 优先用 uid / secUid 精确比对；主播信息只解析到昵称时才退化为昵称比对。
+ * 主播信息取不到时返回 false（不误伤普通观众）。
+ */
+function isAnchorChatEvent(ev: ChatEvent, meta: RoomMeta | null | undefined): boolean {
+  if (!meta || !ev.user) return false;
+  const uid = ev.user.id?.trim();
+  if (meta.uid && uid) return meta.uid === uid;
+  const secUid = ev.user.secUid?.trim();
+  if (meta.secUid && secUid) return meta.secUid === secUid;
+  const nickname = ev.user.nickname?.trim();
+  return Boolean(meta.nickname && nickname && meta.nickname.trim() === nickname);
+}
+
+/**
  * 重复弹幕判定用的归一化文本：全角转半角，去掉空白、标点和零宽字符。
  * 这样「这游戏叫什么？」「这游戏叫什么」「这 游戏 叫什么！」会被视为同一条。
  */
@@ -842,8 +1005,8 @@ function parseDebugLine(line: string): { nickname: string; content: string } {
 }
 
 /**
- * 判断一句弹幕是否像咨询/求助。预检索只处理问题句，避免把整批闲聊
- * 都拿去做关键词匹配，导致无关文档片段混进提示词。
+ * 判断一句弹幕是否像咨询/求助。工具调用降级时的本地检索只处理问题句，
+ * 避免把整批闲聊都拿去做关键词匹配，导致无关文档片段混进提示词。
  */
 function looksLikeQuestion(text: string): boolean {
   if (/[?？]/.test(text)) return true;
@@ -851,7 +1014,7 @@ function looksLikeQuestion(text: string): boolean {
   return /\b(?:how|what|why|when|where|which|can|price|refund|help|order|link|support)\b/i.test(text);
 }
 
-/** 把预检索片段拼进提示词，限制总长度，避免上下文过长 */
+/** 把降级检索到的片段拼进提示词，限制总长度，避免上下文过长 */
 function formatKnowledgeSnippets(hits: KnowledgeHit[]): string {
   let budget = 3000;
   const parts: string[] = [];
@@ -873,12 +1036,40 @@ function isToolCapabilityError(error: unknown): boolean {
   return /(?:tool|function|function_call)/i.test(error.message);
 }
 
-function extractKnowledgeHits(result: unknown): KnowledgeToolHit[] {
+function extractKnowledgeDocs(result: unknown): KnowledgeDocResult[] {
   if (!result || typeof result !== 'object') return [];
-  const results = (result as { results?: unknown }).results;
-  if (!Array.isArray(results)) return [];
-  return results.filter((item): item is KnowledgeToolHit =>
-    Boolean(item) && typeof item === 'object' && typeof (item as KnowledgeToolHit).doc === 'string');
+  const documents = (result as { documents?: unknown }).documents;
+  if (!Array.isArray(documents)) return [];
+  return documents.filter((item): item is KnowledgeDocResult =>
+    Boolean(item) && typeof item === 'object' && typeof (item as KnowledgeDocResult).name === 'string');
+}
+
+/** README 索引与回答规范是流程文件，不参与“读取文档”和降级检索 */
+function isSpecialKnowledgeDoc(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower === KNOWLEDGE_INDEX_NAME.toLowerCase() || lower === KNOWLEDGE_RULES_NAME.toLowerCase();
+}
+
+/** 把模型给的文件名解析成知识库里的真实文件名（容忍大小写、缺扩展名、引号） */
+function resolveKnowledgeDocName(raw: string, names: string[]): string | undefined {
+  const value = basename(raw.trim().replace(/^['"“”「」]+|['"“”「」]+$/g, '')).trim();
+  if (!value) return undefined;
+  const exact = names.find((name) => name === value);
+  if (exact) return exact;
+  const lower = value.toLowerCase();
+  const insensitive = names.find((name) => name.toLowerCase() === lower);
+  if (insensitive) return insensitive;
+  if (!/\.[a-z0-9]+$/i.test(value)) {
+    for (const ext of ['.md', '.txt']) {
+      const candidate = names.find((name) => name.toLowerCase() === `${lower}${ext}`);
+      if (candidate) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function clipText(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}\n…（内容过长，已截断）` : text;
 }
 
 /** 清理模型输出：去包裹引号、合并换行、截断到配置长度 */

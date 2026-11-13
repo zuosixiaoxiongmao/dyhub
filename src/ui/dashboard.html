@@ -379,7 +379,7 @@
     <div class="debug-head">
       <div>
         <div class="debug-title" id="aiDebugTitle">AI 回复调试</div>
-        <div class="debug-sub">使用已保存的 AI 设置，模拟观众弹幕，走完整的知识库预检索 / Agent / 回复生成流程；<b>不会发送到直播间</b>。每行一条，格式「昵称：弹幕内容」，不写昵称时按一条测试观众弹幕处理。按 <kbd>F3</kbd> 打开或关闭。</div>
+        <div class="debug-sub">使用已保存的 AI 设置，模拟观众弹幕，走完整的 README 索引 / 文档读取 / 回答规范注入 / 回复生成流程；<b>不会发送到直播间</b>。每行一条，格式「昵称：弹幕内容」，不写昵称时按一条测试观众弹幕处理。按 <kbd>F3</kbd> 打开或关闭。</div>
       </div>
       <button id="aiDebugClose" class="ghost">关闭</button>
     </div>
@@ -1266,7 +1266,7 @@ curl -X POST http://${base}/api/webhooks \\
     const meta = [`耗时 ${Number(j.elapsedMs) || 0} ms`, `模型轮数 ${Number(j.rounds) || 0}`];
     const sources = Array.isArray(j.sources) && j.sources.length
       ? `<div class="debug-meta">知识库来源：${j.sources.map((s) => `<span class="debug-source">${escapeHtml(s)}</span>`).join('')}</div>`
-      : '<div class="debug-meta">知识库来源：无命中</div>';
+      : '<div class="debug-meta">知识库来源：未读取文档</div>';
     const steps = Array.isArray(j.steps) && j.steps.length
       ? `<div class="debug-meta">执行步骤</div><ol class="debug-steps">${j.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>`
       : '';

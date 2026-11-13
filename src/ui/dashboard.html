@@ -39,7 +39,7 @@
   .ai-log-head { padding: 7px 12px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; }
   .ai-log-body { min-height: 0; flex: 1; overflow: auto; padding: 6px 12px; font: 11px/1.5 'SF Mono', Consolas, monospace; }
   .ai-log-row { display: grid; grid-template-columns: 68px 70px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px solid #f0f0ed; white-space: pre-wrap; word-break: break-word; }
-  .ai-log-row.sent .ai-log-status { color: #2d7a4c; } .ai-log-row.skipped .ai-log-status { color: #9b751f; } .ai-log-row.error .ai-log-status { color: #a33; } .ai-log-row.checking .ai-log-status { color: var(--accent-dark); } .ai-log-row.tool .ai-log-status { color: #6b5bd2; }
+  .ai-log-row.sent .ai-log-status { color: #2d7a4c; } .ai-log-row.skipped .ai-log-status { color: #9b751f; } .ai-log-row.error .ai-log-status { color: #a33; } .ai-log-row.checking .ai-log-status { color: var(--accent-dark); } .ai-log-row.tool .ai-log-status { color: #6b5bd2; } .ai-log-row.idle .ai-log-status { color: #2a6fb0; }
   .ai-log-status { font-weight: 600; }
   .side-divider { flex: 0 0 auto; height: 0; border: 0; border-top: 1px solid var(--border); margin: 0; }
   .panel-title { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
@@ -238,6 +238,7 @@
       <div class="panel-title">AI 管理员 / 咨询助手</div>
         <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiEnabled" type="checkbox" />启用管理员自动回复</label>
         <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiKnowledge" type="checkbox" />启用知识库检索</label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:8px;"><input id="aiSuggest" type="checkbox" />记录游戏改进建议与 BUG</label>
         <input id="aiBaseUrl" placeholder="API 地址，如 https://api.openai.com/v1" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiModel" placeholder="模型名称，如 gpt-4o-mini" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
         <input id="aiKey" type="password" placeholder="API Key（保存在本机）" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;margin-bottom:6px;" />
@@ -260,6 +261,21 @@
           <div style="display:flex;gap:6px;margin-bottom:6px;"><input id="kbQuery" placeholder="试检索，如：怎么退款" style="flex:1;min-width:0;padding:6px;border:1px solid var(--border);border-radius:7px;" /><button id="kbSearch" class="ghost" style="padding:5px 8px;">检索</button></div>
           <div id="kbResult" style="font-size:10px;color:var(--muted);max-height:150px;overflow:auto;"></div>
           <div id="kbMsg" style="font-size:10px;color:var(--muted);margin-top:4px;"></div>
+        </details>
+        <details style="margin:8px 0;border:1px solid var(--border);border-radius:8px;padding:7px 8px;">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;">游戏改进建议 / BUG（AI 记录）</summary>
+          <div style="font-size:10px;color:var(--muted);margin:6px 0;">AI 从弹幕中识别出对游戏的具体改进建议或 BUG 反馈时自动记录到这里（同房间 7 天内相同内容只记一条）。</div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;"><button id="sgRefresh" class="ghost" style="padding:5px 8px;">刷新</button><button id="sgClear" class="ghost" style="padding:5px 8px;">清空全部</button></div>
+          <div id="sgResult" style="font-size:10px;color:var(--muted);max-height:220px;overflow:auto;"></div>
+          <div id="sgMsg" style="font-size:10px;color:var(--muted);margin-top:4px;"></div>
+        </details>
+        <details style="margin:8px 0;border:1px solid var(--border);border-radius:8px;padding:7px 8px;">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;">定时回复（长时间无人发言时自动发弹幕）</summary>
+          <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin:8px 0 6px;"><input id="aiIdleEnabled" type="checkbox" />启用定时回复</label>
+          <label style="font-size:11px;">无弹幕多久后发送（秒）<input id="aiIdleIntervalSec" type="number" min="30" max="86400" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;margin-top:4px;" /></label>
+          <div style="font-size:10px;color:var(--muted);margin:6px 0 4px;">定时话术（每行一条，按顺序轮换发送，最多 50 条）</div>
+          <textarea id="aiIdleMessages" rows="4" placeholder="每行一条话术，例如：欢迎来到直播间～" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;resize:vertical;margin-bottom:6px;"></textarea>
+          <div style="font-size:10px;color:var(--muted);">与「启用管理员自动回复」相互独立，不调用模型；需要浏览器内核 + 已登录账号（轻量内核只能采集，不能发弹幕）。</div>
         </details>
         <button id="aiDebugOpen" class="ghost" style="width:100%;margin-bottom:6px;">调试 AI 回复（F3）</button>
         <button id="aiSave" style="width:100%;">保存 AI 设置</button><div id="aiMsg" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
@@ -847,16 +863,20 @@ curl -X POST http://${base}/api/webhooks \\
       $('aiEnabled').checked = c.enabled; $('aiBaseUrl').value = c.baseUrl; $('aiModel').value = c.model;
       $('aiKey').placeholder = c.apiKey ? '已保存 API Key；留空保持不变' : 'API Key（保存在本机）';
       $('aiKnowledge').checked = c.knowledgeEnabled !== false;
+      $('aiSuggest').checked = c.suggestionEnabled !== false;
       $('kbDir').value = c.knowledgeDir || 'data/knowledge';
       kbResolvedDir = c.knowledgeDirResolved || '';
       $('aiMaxChars').value = c.replyMaxChars || 180; $('aiMaxRounds').value = c.maxRounds || 3;
       $('aiReplyGap').value = Number(c.replyIntervalMs ?? 3000) / 1000; $('aiDupWindow').value = c.duplicateWindowSec ?? 300;
       $('aiCount').value = c.count; $('aiInterval').value = c.intervalSec;
+      $('aiIdleEnabled').checked = Boolean(c.idleReplyEnabled);
+      $('aiIdleIntervalSec').value = c.idleReplyIntervalSec ?? 300;
+      $('aiIdleMessages').value = Array.isArray(c.idleReplyMessages) ? c.idleReplyMessages.join('\n') : '';
       try { await loadPrompts(c.promptFile); } catch (e) { $('aiMsg').textContent = `加载提示词失败：${kbErrorText(e)}`; }
-      await loadKnowledgeDocs(); updateAiLogConnection();
+      await loadKnowledgeDocs(); await loadSuggestions(); updateAiLogConnection();
     } catch (e) { $('aiMsg').textContent = `加载 AI 配置失败：${kbErrorText(e)}`; }
   }
-  const aiLogStatus = { checking: '判断中', tool: '检索中', skipped: '未回复', sent: '已回复', error: '错误' };
+  const aiLogStatus = { checking: '判断中', tool: '检索中', skipped: '未回复', sent: '已回复', error: '错误', idle: '定时' };
   const seenAiLogIds = new Set();
   function appendAiLog(log) {
     if (seenAiLogIds.has(log.id)) return;
@@ -865,7 +885,7 @@ curl -X POST http://${base}/api/webhooks \\
     const row = document.createElement('div'); row.className = `ai-log-row ${log.status}`;
     const time = new Date(log.ts).toLocaleTimeString();
     const sources = Array.isArray(log.sources) && log.sources.length ? `📚 ${log.sources.join('、')}` : '';
-    const detail = [log.roomId ? `房间 ${log.roomId}` : '', log.inputCount ? `${log.inputCount} 条新弹幕` : '', log.message || '', sources, log.output ? `LLM：${log.output}` : ''].filter(Boolean).join(' · ');
+    const detail = [log.roomId ? `房间 ${log.roomId}` : '', log.inputCount ? `${log.inputCount} 条新弹幕` : '', log.message || '', sources, log.output ? `${log.status === 'idle' ? '发送' : 'LLM'}：${log.output}` : ''].filter(Boolean).join(' · ');
     row.innerHTML = `<span>${escapeHtml(time)}</span><span class="ai-log-status">${aiLogStatus[log.status] || log.status}</span><span>${escapeHtml(detail)}</span>`;
     body.appendChild(row); while (body.children.length > 200) body.removeChild(body.firstChild); body.scrollTop = body.scrollHeight;
     $('aiLogState').textContent = log.message || aiLogStatus[log.status] || '';
@@ -940,20 +960,56 @@ curl -X POST http://${base}/api/webhooks \\
         : '<div style="color:var(--muted);">没有命中，换几个关键词试试。</div>';
     } catch (e) { $('kbResult').textContent = `检索失败：${kbErrorText(e)}`; }
   };
+  async function loadSuggestions() {
+    try {
+      const j = await kbRequest('/api/ai-chat/suggestions?limit=200');
+      const items = j && Array.isArray(j.suggestions) ? j.suggestions : [];
+      $('sgResult').innerHTML = items.length
+        ? items.map((s) => {
+            const time = new Date(s.ts).toLocaleString();
+            const head = `<b>${escapeHtml(s.category || '其他')}</b> ${escapeHtml(s.player || '匿名')} · ${escapeHtml(time)} · 房间 ${escapeHtml(s.roomId || '')}`;
+            const original = s.original ? `<div style="color:#999;">原文：${escapeHtml(s.original)}</div>` : '';
+            return `<div style="border-top:1px solid #eee;padding:4px 0;">${head} <button class="ghost sg-del" data-id="${s.id}" style="padding:1px 5px;font-size:10px;margin-left:4px;">删除</button><div style="color:#555;white-space:pre-wrap;">${escapeHtml(s.content || '')}</div>${original}</div>`;
+          }).join('')
+        : '<div style="color:var(--muted);">暂无记录。AI 判断弹幕是游戏改进建议或 BUG 时会自动写入。</div>';
+      $('sgResult').querySelectorAll('.sg-del').forEach((btn) => {
+        btn.onclick = async () => {
+          try {
+            await kbRequest(`/api/ai-chat/suggestions/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' });
+            $('sgMsg').textContent = '建议已删除。';
+            await loadSuggestions();
+          } catch (e) { $('sgMsg').textContent = `删除失败：${kbErrorText(e)}`; }
+        };
+      });
+    } catch (e) {
+      $('sgResult').innerHTML = '<div style="color:var(--muted);">加载失败。</div>';
+      $('sgMsg').textContent = `加载建议失败：${kbErrorText(e)}`;
+    }
+  }
+  $('sgRefresh').onclick = () => loadSuggestions();
+  $('sgClear').onclick = async () => {
+    if (!confirm('确定清空所有已记录的游戏改进建议？')) return;
+    try {
+      const j = await kbRequest('/api/ai-chat/suggestions', { method: 'DELETE' });
+      $('sgMsg').textContent = `已清空 ${j && j.removed ? j.removed : 0} 条建议。`;
+      await loadSuggestions();
+    } catch (e) { $('sgMsg').textContent = `清空失败：${kbErrorText(e)}`; }
+  };
   let aiLogStream = null; let aiLogRetry = null;
+  function aiLogEnabled() { return $('aiEnabled').checked || $('aiIdleEnabled').checked; }
   function connectAiLogs() {
-    if (!$('aiEnabled').checked) { $('aiLogState').textContent = '自动发言未启用'; return; }
+    if (!aiLogEnabled()) { $('aiLogState').textContent = '自动回复与定时回复均未启用'; return; }
     if (aiLogStream && (aiLogStream.readyState === WebSocket.OPEN || aiLogStream.readyState === WebSocket.CONNECTING)) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const stream = new WebSocket(`${proto}//${location.host}/api/ai-chat/log-stream`);
     aiLogStream = stream;
     stream.onopen = () => { $('aiLogState').textContent = '实时日志已连接'; };
     stream.onmessage = (ev) => { try { appendAiLog(JSON.parse(ev.data)); } catch {} };
-    stream.onclose = () => { if (aiLogStream === stream) aiLogStream = null; if ($('aiEnabled').checked) aiLogRetry = setTimeout(connectAiLogs, 3000); };
+    stream.onclose = () => { if (aiLogStream === stream) aiLogStream = null; if (aiLogEnabled()) aiLogRetry = setTimeout(connectAiLogs, 3000); };
   }
   function updateAiLogConnection() {
-    if ($('aiEnabled').checked) connectAiLogs();
-    else { clearTimeout(aiLogRetry); aiLogRetry = null; if (aiLogStream) { const stream = aiLogStream; aiLogStream = null; stream.close(); } $('aiLogState').textContent = '自动发言未启用'; }
+    if (aiLogEnabled()) connectAiLogs();
+    else { clearTimeout(aiLogRetry); aiLogRetry = null; if (aiLogStream) { const stream = aiLogStream; aiLogStream = null; stream.close(); } $('aiLogState').textContent = '自动回复与定时回复均未启用'; }
   }
   $('aiLogClear').onclick = () => { $('aiLogBody').innerHTML = '<div style="color:var(--muted);">显示已清空；新日志会继续出现</div>'; };
   $('aiPromptFile').onchange = () => { const p = aiPrompts.find(x => x.name === $('aiPromptFile').value); if (p) $('aiPrompt').value = p.content; };
@@ -972,9 +1028,12 @@ curl -X POST http://${base}/api/webhooks \\
   };
   $('aiSave').onclick = async () => {
     try {
-      const j = await kbRequest('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, knowledgeEnabled: $('aiKnowledge').checked, knowledgeDir: $('kbDir').value, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), replyMaxChars: Number($('aiMaxChars').value), maxRounds: Number($('aiMaxRounds').value), replyIntervalMs: Number($('aiReplyGap').value) * 1000, duplicateWindowSec: Number($('aiDupWindow').value), promptFile: $('aiPromptFile').value }) });
+      const j = await kbRequest('/api/ai-chat', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: $('aiEnabled').checked, knowledgeEnabled: $('aiKnowledge').checked, suggestionEnabled: $('aiSuggest').checked, knowledgeDir: $('kbDir').value, baseUrl: $('aiBaseUrl').value, model: $('aiModel').value, apiKey: $('aiKey').value, count: Number($('aiCount').value), intervalSec: Number($('aiInterval').value), replyMaxChars: Number($('aiMaxChars').value), maxRounds: Number($('aiMaxRounds').value), replyIntervalMs: Number($('aiReplyGap').value) * 1000, duplicateWindowSec: Number($('aiDupWindow').value), promptFile: $('aiPromptFile').value, idleReplyEnabled: $('aiIdleEnabled').checked, idleReplyIntervalSec: Number($('aiIdleIntervalSec').value), idleReplyMessages: $('aiIdleMessages').value.split(/\r?\n/) }) });
       $('aiMsg').textContent = '设置已保存；对所有运行中的直播间生效。';
       $('aiKey').value = '';
+      // 服务端会规范化话术（去空行 / 去重 / 截断），回写展示实际生效的内容
+      $('aiIdleIntervalSec').value = j.config.idleReplyIntervalSec;
+      $('aiIdleMessages').value = Array.isArray(j.config.idleReplyMessages) ? j.config.idleReplyMessages.join('\n') : '';
       $('kbDir').value = j.config.knowledgeDir;
       kbResolvedDir = j.config.knowledgeDirResolved || '';
       await loadKnowledgeDocs();

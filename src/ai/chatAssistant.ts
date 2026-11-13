@@ -6,6 +6,7 @@ import type { EventBus } from '../pipeline/eventBus.js';
 import type { Collector } from '../collector/collector.js';
 import type { RoomMeta } from '../collector/roomMeta.js';
 import { DocumentKnowledgeBase, type KnowledgeDoc, type KnowledgeDocMeta, type KnowledgeHit } from './knowledgeBase.js';
+import { SuggestionStore, type SuggestionRecord } from './suggestionStore.js';
 import { runAgent, type AgentMessage, type AgentStep, type AgentTool } from './agent.js';
 
 const DATA_DIR = join(process.cwd(), 'data');
@@ -34,6 +35,8 @@ export interface AiConfig {
   knowledgeDir: string;
   /** 是否允许 Agent 检索文档知识库 */
   knowledgeEnabled: boolean;
+  /** 是否允许 Agent 把弹幕里的游戏改进建议 / BUG 记录到文件 */
+  suggestionEnabled: boolean;
   /** 单轮最多调用几次工具（防止模型无限检索） */
   maxRounds: number;
   /** 单条弹幕回复的最大字符数 */
@@ -42,13 +45,19 @@ export interface AiConfig {
   replyIntervalMs: number;
   /** 重复弹幕忽略窗口（秒），0 表示不忽略 */
   duplicateWindowSec: number;
+  /** 直播间长时间无弹幕时自动发预设话术（独立于 enabled，不调用模型） */
+  idleReplyEnabled: boolean;
+  /** 弹幕静默多少秒后发送定时回复 */
+  idleReplyIntervalSec: number;
+  /** 定时回复话术，按顺序轮换 */
+  idleReplyMessages: string[];
 }
 
 export interface AiLog {
   id: number;
   ts: number;
   roomId: string;
-  status: 'checking' | 'tool' | 'skipped' | 'sent' | 'error';
+  status: 'checking' | 'tool' | 'skipped' | 'sent' | 'error' | 'idle';
   inputCount?: number;
   output?: string;
   /** 这条回复对应的观众昵称（模型返回了 player_name 时） */
@@ -122,6 +131,12 @@ const MAX_DOC_READ_TOTAL_CHARS = 10_000;
 const MAX_INDEX_CHARS = 4000;
 const MAX_RULES_CHARS = 4000;
 
+/** 定时回复：静默检测周期；定时话术的条数与单条长度上限 */
+const IDLE_TICK_MS = 10_000;
+const MAX_IDLE_MESSAGES = 50;
+const MAX_IDLE_MESSAGE_CHARS = 200;
+const DEFAULT_IDLE_REPLY_MESSAGE = '欢迎来到直播间～有问题随时在弹幕里问，我看到会尽快回复。';
+
 const defaults: AiConfig = {
   enabled: false,
   count: 10,
@@ -132,10 +147,14 @@ const defaults: AiConfig = {
   intervalSec: 20,
   knowledgeDir: process.env.DYHUB_KNOWLEDGE_DIR?.trim() || 'data/knowledge',
   knowledgeEnabled: true,
+  suggestionEnabled: true,
   maxRounds: 3,
   replyMaxChars: 180,
   replyIntervalMs: DEFAULT_REPLY_INTERVAL_MS,
   duplicateWindowSec: 300,
+  idleReplyEnabled: false,
+  idleReplyIntervalSec: 300,
+  idleReplyMessages: [DEFAULT_IDLE_REPLY_MESSAGE],
 };
 
 /** Agent 固定工作流：人设可以换，职责与输出约束不随提示词文件漂移 */
@@ -143,11 +162,13 @@ const AGENT_RULES = `你的职责是解答直播间观众的问题、提供咨�
 
 工作流程：
 1. 阅读“本轮新弹幕”，判断是否有观众在寻求帮助或咨询（产品、使用方法、价格、优惠、售后、物流、活动规则等）。
-2. 遇到咨询类问题，先阅读用户消息里附带的“知识库索引”（README.md，列出每篇文档的书名与关键字），从中挑出与问题相关的文档，调用 read_knowledge 读取完整内容；只读相关文档，不要凭索引猜测答案。系统会在读取成功后附上“回答规范”，必须按规范作答，并严格依据文档内容；资料没有覆盖时如实说明“这个我不太确定”，不要编造。
-3. 非咨询类内容（闲聊、打招呼、刷屏、无意义表情）一般不需要回复，也不要读取文档；没有值得处理的咨询或求助时只输出 [SKIP]。
-4. 回答要完整、具体、可直接执行，像真人管理员在弹幕里解答：一般 2-4 句，把关键步骤或条件说清楚。
-5. 不要提及知识库、检索、工具或 AI。
-6. 可能同时有多个观众需要回复：每个需要回复的观众单独一条，不要合并成一条，也不要重复回复同一个人。只输出一个 JSON 对象，键使用“本轮新弹幕”前的编号，值为 {"player_name":"观众昵称","content":"要发送的弹幕正文"}；不要输出代码块、解释或 JSON 以外的文字。没有需要回复的观众时只输出 [SKIP]。
+2. 遇到咨询类问题，先阅读用户消息里附带的“知识库索引”（README.md，列出每篇文档的书名与关键字），从中挑出与问题相关的文档，调用 read_knowledge 读取完整内容；只读相关文档，不要凭索引猜测答案。系统会在读取成功后附上“回答规范”，必须按规范作答，并严格依据文档内容；资料没有覆盖时如实说明“这个我不太确定”，不要编造。回答时同时遵守人设文件中的内容边界与禁忌话题，超出边界的问题按人设话术婉拒。
+3. 如果弹幕包含对游戏的具体改进建议或 BUG 反馈（玩法、平衡、数值、功能、操作体验、性能、报错、卡顿、闪退等），调用 record_suggestion 记录提炼后的内容；一条一次调用，同类可合并。BUG 描述清楚时直接记录；描述太模糊（如只说“有 BUG”“卡了”“闪退了”）时，先用 1-2 句自然追问：具体是什么现象、在哪个界面或玩法、怎么操作后出现、能不能复现，不要一次问一大串或审问式连问；等观众补充后再记录完整问题。记录是后台行为，回复中不要提及“已记录 / 已反馈 / 工具”，也不要承诺修复时间。
+4. 只要弹幕涉及“刷什么礼物能抽装备 / 中奖 / 返利 / 送什么道具”等礼物抽奖话题，只做一件事：引导观众查看游戏内的“礼物效果”界面，并提醒理性消费。不接这类话题，不追问、不评价活动，不确认或解释礼物名称、概率、道具效果和奖励规则；不得鼓励、劝说或诱导观众刷礼物。不要和观众讨论平台规则或是否违规。
+5. 非咨询类内容（闲聊、打招呼、刷屏、无意义表情）一般不需要回复，也不要读取文档；没有值得处理的咨询、求助或改进建议时只输出 [SKIP]。
+6. 回答要具体、可直接执行；具体篇幅、语气和话术以人设文件为准。
+7. 不要提及知识库、检索、工具或 AI。
+8. 可能同时有多个观众需要回复：每条需要回答的弹幕单独输出一条。同一位观众提了多个不同问题时，必须逐条全部回答，不能只答其中一条，也不要为了省事把多个问题合并后漏掉内容；完全相同的内容只输出一次。只输出一个 JSON 对象，键使用“本轮新弹幕”前的编号，值为 {"player_name":"观众昵称","content":"要发送的弹幕正文"}；不要输出代码块、解释或 JSON 以外的文字。没有需要回复的观众时只输出 [SKIP]。
 示例：
 {"1":{"player_name":"张三","content":"直接发送宗门名就能加入。"},"2":{"player_name":"李四","content":"月卡 30 元，在商城即可开通。"}}`;
 
@@ -158,19 +179,37 @@ function save(c: AiConfig) { mkdirSync(join(process.cwd(), 'data'), { recursive:
 
 export class ChatAssistant {
   private config = load();
-  private knowledgeDir = resolveKnowledgeDir(this.config.knowledgeDir);
-  private knowledge = new DocumentKnowledgeBase(this.knowledgeDir);
+  private knowledgeDir!: string;
+  private knowledge!: DocumentKnowledgeBase;
+  private suggestions = new SuggestionStore();
   private recent = new Map<string, ChatEvent[]>();
   private running = new Set<string>();
   private pending = new Map<string, ChatEvent[]>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** 各房间最近已处理的弹幕内容签名 → 过期时间，用于抑制重复弹幕 */
   private handledChats = new Map<string, Map<string, number>>();
+  /** 各房间最近一条非空弹幕的接收时间（毫秒），用于静默计时 */
+  private idleLastChatAt = new Map<string, number>();
+  /** 各房间下一条定时话术的序号 */
+  private idleCursor = new Map<string, number>();
+  private idleTimer: ReturnType<typeof setInterval> | null = null;
   private logs: AiLog[] = [];
   private nextLogId = 1;
   private listeners = new Set<(log: AiLog) => void>();
   private subscription: number;
   constructor(private bus: EventBus, private collector: Collector) {
+    // 知识库目录不可用（例如从另一台机器带过来的绝对路径、盘符不存在）时
+    // 回退到默认目录，不能让一个可选功能拖垮整个采集服务。
+    const requestedDir = resolveKnowledgeDir(this.config.knowledgeDir);
+    try {
+      this.knowledge = new DocumentKnowledgeBase(requestedDir);
+      this.knowledgeDir = requestedDir;
+    } catch (e) {
+      const fallbackDir = resolveKnowledgeDir(defaults.knowledgeDir);
+      this.knowledge = new DocumentKnowledgeBase(fallbackDir);
+      this.knowledgeDir = fallbackDir;
+      console.warn(`[dyhub] 知识库目录不可用（${requestedDir}）：${e instanceof Error ? e.message : String(e)}；已回退到 ${fallbackDir}`);
+    }
     mkdirSync(PROMPT_DIR, { recursive: true });
     const legacy = load() as AiConfig & { systemPrompt?: string };
     if (legacy.systemPrompt && !existsSync(join(PROMPT_DIR, defaults.promptFile))) {
@@ -182,9 +221,18 @@ export class ChatAssistant {
     if (existsSync(defaultPromptPath) && readFileSync(defaultPromptPath, 'utf8').trim() === LEGACY_DEFAULT_PROMPT) {
       writeFileSync(defaultPromptPath, DEFAULT_PROMPT, 'utf8');
     }
-    this.config = { ...this.config, promptFile: this.safePromptName(legacy.promptFile) || defaults.promptFile };
+    this.config = {
+      ...this.config,
+      promptFile: this.safePromptName(legacy.promptFile) || defaults.promptFile,
+      idleReplyMessages: normalizeIdleMessages(this.config.idleReplyMessages),
+    };
     this.subscription = bus.subscribe({ type: 'chat' }, (ev) => {
-      if (ev.type !== 'chat' || !ev.data.content.trim() || !this.config.enabled) return;
+      if (ev.type !== 'chat') return;
+      const text = ev.data.content.trim();
+      // 静默计时独立于自动回复开关：贴纸弹幕 content 为空，不算“有人在说话”。
+      // 用接收时间而不是发送时间，避免机器时钟偏差让计时永远不满足。
+      if (text) this.idleLastChatAt.set(ev.roomId, Math.min(ev.receivedAt || ev.ts || Date.now(), Date.now()));
+      if (!text || !this.config.enabled) return;
       // 主播自己的发言不进入 AI 上下文，也不触发回复，避免直播间出现“主播自答自话”
       if (isAnchorChatEvent(ev, this.collector.getRoomInfo(ev.roomId)?.meta)) return;
       const list = this.recent.get(ev.roomId) ?? [];
@@ -195,6 +243,7 @@ export class ChatAssistant {
       this.pending.set(ev.roomId, pending);
       this.schedule(ev.roomId);
     });
+    if (this.config.idleReplyEnabled) this.startIdleTicker();
   }
   getConfig() { return { ...this.config, apiKey: this.config.apiKey ? '••••••••' : '', knowledgeDirResolved: this.knowledgeDir }; }
   getLogs() { return this.logs.slice(-200).reverse(); }
@@ -224,7 +273,12 @@ export class ChatAssistant {
     c.replyMaxChars = Math.max(20, Math.min(500, Math.floor(Number(c.replyMaxChars) || 180)));
     c.replyIntervalMs = Math.max(0, Math.min(60_000, Math.floor(Number(c.replyIntervalMs) || 0)));
     c.duplicateWindowSec = Math.max(0, Math.min(3600, Math.floor(Number(c.duplicateWindowSec) || 0)));
+    c.idleReplyIntervalSec = Math.max(30, Math.min(86400, Math.floor(Number(c.idleReplyIntervalSec) || 300)));
+    c.idleReplyEnabled = input.idleReplyEnabled === undefined ? this.config.idleReplyEnabled : Boolean(input.idleReplyEnabled);
+    c.idleReplyMessages = normalizeIdleMessages(input.idleReplyMessages === undefined ? this.config.idleReplyMessages : input.idleReplyMessages);
+    if (c.idleReplyEnabled && !c.idleReplyMessages.length) throw new Error('启用定时回复时至少需要一条非空话术');
     c.knowledgeEnabled = input.knowledgeEnabled === undefined ? this.config.knowledgeEnabled : Boolean(input.knowledgeEnabled);
+    c.suggestionEnabled = input.suggestionEnabled === undefined ? this.config.suggestionEnabled : Boolean(input.suggestionEnabled);
     c.knowledgeDir = String(c.knowledgeDir ?? '').trim() || defaults.knowledgeDir;
     c.baseUrl = String(c.baseUrl || defaults.baseUrl).replace(/\/+$/, '');
     c.model = String(c.model || '').trim();
@@ -239,6 +293,7 @@ export class ChatAssistant {
       catch (e) { throw new Error(`无法使用知识库目录「${nextDir}」：${e instanceof Error ? e.message : String(e)}`); }
     }
     const wasEnabled = this.config.enabled;
+    const wasIdleEnabled = this.config.idleReplyEnabled;
     this.config = c;
     this.knowledge = nextKnowledge;
     this.knowledgeDir = nextDir;
@@ -248,6 +303,8 @@ export class ChatAssistant {
       this.timers.clear();
       this.pending.clear();
     }
+    if (!wasIdleEnabled && c.idleReplyEnabled) this.startIdleTicker();
+    else if (wasIdleEnabled && !c.idleReplyEnabled) this.stopIdleTicker();
     return this.getConfig();
   }
 
@@ -257,6 +314,11 @@ export class ChatAssistant {
   saveKnowledge(name: string, content: string): KnowledgeDoc { return this.knowledge.save(name, content); }
   removeKnowledge(name: string): boolean { return this.knowledge.remove(name); }
   searchKnowledge(query: string, limit?: number): Promise<KnowledgeHit[]> { return this.knowledge.search(query, limit); }
+
+  // ---- 游戏改进建议 / BUG（Agent 通过 record_suggestion 工具写入） ----
+  listSuggestions(roomId?: string, limit?: number): SuggestionRecord[] { return this.suggestions.list(roomId, limit); }
+  removeSuggestion(id: number): boolean { return this.suggestions.remove(id); }
+  clearSuggestions(roomId?: string): number { return this.suggestions.clear(roomId); }
 
   /**
    * 过滤重复弹幕：同一批内相同内容只保留第一条，并跳过最近已处理过的相同内容。
@@ -306,6 +368,43 @@ export class ChatAssistant {
       if (oldest === undefined) break;
       cache.delete(oldest);
     }
+  }
+
+  /**
+   * 构建发给模型的“最近弹幕上下文”：
+   * - 已处理 / 已回复过的内容（handledChats）直接排除，不再请求模型；
+   * - 与本轮新弹幕相同的内容排除，避免模型把新问题当成历史问题；
+   * - 上下文内部相同内容只保留最新一条。
+   * 返回空数组是合法的，表示本轮没有可参考的历史语境。
+   */
+  private buildRecentContext(roomId: string, fresh: ChatEvent[]): ChatEvent[] {
+    const now = Date.now();
+    const handled = this.handledChats.get(roomId);
+    const isHandled = (key: string): boolean => {
+      const expiresAt = handled?.get(key);
+      return expiresAt !== undefined && expiresAt > now;
+    };
+    const freshKeys = new Set<string>();
+    for (const ev of fresh) {
+      const key = chatSignature(ev.data.content);
+      if (key) freshKeys.add(key);
+    }
+
+    const kept: ChatEvent[] = [];
+    const seen = new Set<string>();
+    const recent = this.recent.get(roomId) ?? [];
+    // 主播信息可能晚于弹幕到达，构建上下文时再剔除一次主播本人的发言
+    const meta = this.collector.getRoomInfo(roomId)?.meta;
+    // 从新到旧扫描，同一内容只保留最新一条
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const ev = recent[i];
+      if (meta && isAnchorChatEvent(ev, meta)) continue;
+      const key = chatSignature(ev.data.content);
+      if (!key || isHandled(key) || freshKeys.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      kept.push(ev);
+    }
+    return kept.reverse().slice(-this.config.count);
   }
 
   private schedule(roomId: string) {
@@ -360,10 +459,9 @@ export class ChatAssistant {
       this.log({ roomId, status: 'tool', inputCount: batch.length, message: `已忽略 ${duplicates} 条重复/近期已处理的弹幕` });
     }
 
-    const recent = (this.recent.get(roomId) ?? [])
-      .filter((ev) => !meta || !isAnchorChatEvent(ev, meta))
-      .slice(-c.count);
-    if (!recent.length) return;
+    // 上下文只保留“还没处理过、且不与本轮新弹幕重复”的弹幕：
+    // 已回复过的内容不再塞给模型，避免同一问题被反复理解或当作已解决而跳过。
+    const recent = this.buildRecentContext(roomId, fresh);
 
     this.running.add(roomId);
     this.log({ roomId, status: 'checking', inputCount: batch.length, message: `正在判断最近 ${recent.length} 条弹幕（本轮新弹幕 ${fresh.length} 条）` });
@@ -446,6 +544,69 @@ export class ChatAssistant {
     }
   }
 
+  // ---- 定时回复：直播间长时间无弹幕时轮换发送预设话术（不调用模型） ----
+
+  private startIdleTicker() {
+    if (this.idleTimer) return;
+    // 还没有静默记录的房间以“开启这一刻”为起点；已有记录的房间沿用最近一条弹幕时间，
+    // 这样启用后若房间其实已经安静很久，会尽快发一条，而不是再等一个完整周期。
+    const now = Date.now();
+    for (const room of this.collector.getRooms()) {
+      if (room.status === 'live' && !this.idleLastChatAt.has(room.roomId)) this.idleLastChatAt.set(room.roomId, now);
+    }
+    this.idleTimer = setInterval(() => void this.idleTick(), IDLE_TICK_MS);
+  }
+
+  private stopIdleTicker() {
+    if (!this.idleTimer) return;
+    clearInterval(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  private async idleTick() {
+    const c = this.config;
+    if (!c.idleReplyEnabled || !c.idleReplyMessages.length) return;
+    const now = Date.now();
+    const rooms = new Map(this.collector.getRooms().map((room) => [room.roomId, room]));
+    // 房间已删除 / 已停止：清理计时与轮换状态，避免长期运行后 Map 无限增长
+    for (const id of [...this.idleLastChatAt.keys()]) {
+      if (rooms.get(id)?.status !== 'live') {
+        this.idleLastChatAt.delete(id);
+        this.idleCursor.delete(id);
+      }
+    }
+    for (const room of rooms.values()) {
+      const roomId = room.roomId;
+      if (room.status !== 'live' || !this.collector.canSendChat(roomId)) continue;
+      const last = this.idleLastChatAt.get(roomId);
+      if (last === undefined) {
+        this.idleLastChatAt.set(roomId, now);
+        continue;
+      }
+      if (now - last < c.idleReplyIntervalSec * 1000) continue;
+      // AI 正在逐条回复时不要插话；它的发言会自然重置静默计时
+      if (this.running.has(roomId)) continue;
+
+      const index = (this.idleCursor.get(roomId) ?? 0) % c.idleReplyMessages.length;
+      const text = c.idleReplyMessages[index];
+      // 先重置计时：即使发送失败，也要等下一个完整静默周期再重试，避免每 10 秒刷一次
+      this.idleLastChatAt.set(roomId, now);
+      this.idleCursor.set(roomId, (index + 1) % c.idleReplyMessages.length);
+      try {
+        await this.collector.sendChat(roomId, text);
+        const minutes = Math.max(1, Math.round(c.idleReplyIntervalSec / 60));
+        this.log({
+          roomId, status: 'idle', output: text,
+          message: `直播间 ${minutes} 分钟无弹幕，发送定时回复（${index + 1}/${c.idleReplyMessages.length}）`,
+        });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        this.log({ roomId, status: 'error', output: text, message: `定时回复发送失败：${message}` });
+        console.error(`[dyhub] 定时回复发送失败 (${roomId}):`, message);
+      }
+    }
+  }
+
   /**
    * 生成回复的核心流程：附带 README 索引 → Agent 按需读取文档 →
    * 第二次请求附文档 + 回答规范 → 清洗输出。
@@ -487,29 +648,38 @@ export class ChatAssistant {
 
     const tools: AgentTool[] = [];
     if (indexDoc) tools.push(this.readKnowledgeTool(docNames));
+    if (c.suggestionEnabled) tools.push(this.recordSuggestionTool(pending));
     const messages: AgentMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(style, c) },
-      { role: 'user', content: this.buildUserPrompt(pending, recent, indexDoc?.content ?? '', tools.length > 0) },
+      { role: 'user', content: this.buildUserPrompt(pending, recent, indexDoc?.content ?? '', Boolean(indexDoc)) },
     ];
-    // 模型可能一次回复多个观众，输出预算随本轮弹幕数增加，避免 JSON 被截断
+    // 模型可能一次回复多个观众，输出预算随本轮弹幕数增加，避免 JSON 被截断。
+    // 推理模型（如 deepseek-flash / reasoner）的思维链 token 也计入 max_tokens，
+    // 预算里必须留出这部分，否则正文会被截在半截、JSON 解析失败后整轮被判为无回复。
     const replyBudget = Math.max(1, Math.min(MAX_REPLIES_PER_ROUND, pending.length));
+    const REASONING_HEADROOM = 800;
     const llm = {
       baseUrl: c.baseUrl,
       apiKey: c.apiKey,
       model: c.model,
       temperature: 0.7,
-      maxTokens: Math.min(2400, Math.max(300, c.replyMaxChars * replyBudget + 150)),
+      maxTokens: Math.min(4000, Math.max(800, c.replyMaxChars * replyBudget + REASONING_HEADROOM)),
     };
     const onToolCall = (step: AgentStep) => {
-      const docs = extractKnowledgeDocs(step.result);
-      const loaded = docs.filter((doc) => doc.content);
-      for (const doc of loaded) sources.add(doc.name);
-      const failed = docs.length - loaded.length;
-      const summary = step.error
-        ? `调用 ${step.tool} 失败：${step.error}`
-        : loaded.length
-          ? `读取知识文档：${loaded.map((doc) => doc.name).join('、')}${failed ? `（${failed} 篇失败）` : ''}`
-          : `调用 ${step.tool} 未读到有效文档`;
+      let summary: string;
+      if (step.tool === 'record_suggestion') {
+        summary = describeSuggestionStep(step);
+      } else {
+        const docs = extractKnowledgeDocs(step.result);
+        const loaded = docs.filter((doc) => doc.content);
+        for (const doc of loaded) sources.add(doc.name);
+        const failed = docs.length - loaded.length;
+        summary = step.error
+          ? `调用 ${step.tool} 失败：${step.error}`
+          : loaded.length
+            ? `读取知识文档：${loaded.map((doc) => doc.name).join('、')}${failed ? `（${failed} 篇失败）` : ''}`
+            : `调用 ${step.tool} 未读到有效文档`;
+      }
       steps.push(summary);
       onStep?.(summary, [...sources], [...steps]);
     };
@@ -640,7 +810,7 @@ export class ChatAssistant {
     const persona = style.trim() || DEFAULT_PROMPT;
     return `${AGENT_RULES}
 
-人设与语气（来自提示词文件，仅用于调整表达方式；与上述职责冲突时以上述职责为准）：
+人设、语气与内容边界（来自提示词文件，用于调整表达方式、回复范围和禁忌话题；不得覆盖上述输出格式、工具调用与 [SKIP] 规则）：
 ${persona}
 
 单条回复不超过 ${c.replyMaxChars} 个字符。${c.knowledgeEnabled ? '' : '\n当前知识库检索已关闭，不要编造资料；拿不准的问题请如实说明或回复 [SKIP]。'}`;
@@ -652,7 +822,7 @@ ${persona}
     const newLines = pending.slice(-30).map((ev, index) => `${index + 1}. ${format(ev)}`).join('\n');
     const contextLines = recent.slice(-30).map(format).join('\n');
     const context = contextLines
-      ? `\n\n最近弹幕上下文（仅供理解语境，不要重复回答已在上下文里解决过的问题）：\n${contextLines}`
+      ? `\n\n最近弹幕上下文（已回复过的弹幕已排除；仅供理解语境，不要重复回答）：\n${contextLines}`
       : '';
     const knowledge = knowledgeIndex
       ? `\n\n知识库索引（每篇文档的书名与关键字；只在观众咨询时从中挑选相关文档，不要读取无关文档）：\n${knowledgeIndex}`
@@ -660,7 +830,7 @@ ${persona}
     const instruction = allowTools
       ? '请判断本轮是否有观众需要帮助/咨询；涉及咨询时，先从“知识库索引”中挑选相关文档并调用 read_knowledge 读取全文，再依据文档内容和系统随后附上的“回答规范”作答；索引里没有相关文档或资料不足时如实说明不确定，不要编造。'
       : '请判断本轮是否有观众需要帮助/咨询；涉及咨询时优先依据“知识库参考”和“回答规范”作答，资料不足时如实说明不确定，不要编造。';
-    return `本轮新弹幕（优先处理，只回答其中尚未得到解答的问题；编号用于输出 JSON 的键）：\n${newLines}${context}${knowledge}\n\n${instruction}每个需要回复的观众单独输出一条，按系统提示的 JSON 格式返回；没有值得回复的内容只输出 [SKIP]。`;
+    return `本轮新弹幕（优先处理；编号用于输出 JSON 的键）：\n${newLines}${context}${knowledge}\n\n${instruction}每条需要回答的弹幕单独输出一条；同一位观众提了多个问题时逐个回答，不要漏答，也不要重复回答同一个问题。按系统提示的 JSON 格式返回；没有值得回复的内容只输出 [SKIP]。`;
   }
 
   /** 按本轮弹幕逐条本地检索，去重后取少量片段；单条检索失败不影响其他弹幕 */
@@ -778,10 +948,70 @@ ${persona}
     };
   }
 
+  /**
+   * 改进建议 / BUG 记录工具：模型从弹幕中识别出对游戏的改进建议或 BUG 反馈后调用，
+   * 写入 data/ai-suggestions.json（按房间隔离、内容去重）。
+   */
+  private recordSuggestionTool(pending: ChatEvent[]): AgentTool {
+    return {
+      name: 'record_suggestion',
+      description: '记录观众对游戏的具体改进建议与 BUG 反馈（玩法、平衡、数值、功能、操作体验、性能、报错、卡顿、闪退等）。弹幕明确提出可执行的改进点、异常现象或复现问题时调用；BUG 描述太模糊时不要调用，先向观众追问现象、界面、操作步骤和能否复现，等补充后再记录。闲聊、单纯情绪化抱怨、普通咨询不记录。',
+      parameters: {
+        type: 'object',
+        properties: {
+          content: {
+            type: 'string',
+            description: '提炼后的建议或 BUG：说明现象/现状、出现位置、复现步骤与期望改进，保留关键细节（如玩法名、界面、数值、操作步骤、报错信息），不要照抄整句弹幕。',
+          },
+          player: {
+            type: 'string',
+            description: '提出建议的观众昵称；不确定时留空，系统会尝试从弹幕中匹配。',
+          },
+          category: {
+            type: 'string',
+            enum: ['玩法', '平衡', '功能', '体验', '性能', 'bug', '其他'],
+            description: '建议分类。',
+          },
+          original: {
+            type: 'string',
+            description: '原始弹幕内容，便于回溯；可省略。',
+          },
+        },
+        required: ['content'],
+      },
+      execute: async (args, context) => {
+        // 调试面板的模拟弹幕不写入正式建议库
+        if (context.roomId.startsWith('__debug_')) {
+          return { ok: false, skipped: true, reason: '调试模式不记录建议' };
+        }
+        const content = String(args.content ?? '').trim();
+        if (!content) return { ok: false, error: '建议内容为空' };
+        const original = String(args.original ?? '').trim();
+        const player = normalizePlayerName(args.player) || findSuggestionPlayer(pending, original, content);
+        const { added, record } = this.suggestions.add({
+          roomId: context.roomId,
+          player,
+          category: String(args.category ?? ''),
+          content,
+          original: original || undefined,
+        });
+        return {
+          ok: true,
+          added,
+          id: record.id,
+          category: record.category,
+          content: record.content,
+          message: added ? '已记录' : '已有相同建议，未重复记录',
+        };
+      },
+    };
+  }
+
   close() {
     this.bus.unsubscribe(this.subscription);
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    this.stopIdleTicker();
     this.listeners.clear();
   }
 }
@@ -848,7 +1078,9 @@ function parseReplies(raw: string, pending: ChatEvent[], maxChars: number): Pars
     }
     const content = sanitizeReply(entry.content, maxChars);
     if (!content) continue;
-    const key = player ? `p:${player}` : `c:${content}`;
+    // 按“观众 + 内容”去重：同一观众的不同问题要分别保留，只有完全相同的内容才丢弃。
+    // 不能只按玩家去重，否则同一个人连问两个问题时会静默丢掉后一条回复。
+    const key = `${player}\u0000${chatSignature(content)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     replies.push({ player, content });
@@ -966,6 +1198,22 @@ function normalizePlayerName(value: unknown): string {
     .slice(0, 40);
 }
 
+/** 定时回复话术：去首尾空白、合并换行、丢空行、按归一化内容去重、限制条数与单条长度 */
+function normalizeIdleMessages(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input) {
+    const text = String(raw ?? '').replace(/\s*\n+\s*/g, ' ').trim().slice(0, MAX_IDLE_MESSAGE_CHARS);
+    const key = chatSignature(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= MAX_IDLE_MESSAGES) break;
+  }
+  return out;
+}
+
 /**
  * 判断一条弹幕是否来自直播间主播本人。
  * 优先用 uid / secUid 精确比对；主播信息只解析到昵称时才退化为昵称比对。
@@ -1070,6 +1318,40 @@ function resolveKnowledgeDocName(raw: string, names: string[]): string | undefin
 
 function clipText(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}\n…（内容过长，已截断）` : text;
+}
+
+/** record_suggestion 工具结果的可读摘要（用于 AI 日志 / 调试面板） */
+function describeSuggestionStep(step: AgentStep): string {
+  if (step.error) return `调用 ${step.tool} 失败：${step.error}`;
+  const result = (step.result && typeof step.result === 'object' ? step.result : null) as
+    { ok?: boolean; added?: boolean; skipped?: boolean; reason?: string; error?: string; content?: string; category?: string } | null;
+  if (result?.skipped) return `未记录建议：${result.reason ?? '已跳过'}`;
+  if (result?.ok === false) return `记录建议失败：${result?.error ?? '未知错误'}`;
+  const text = String(result?.content ?? step.args.content ?? '').trim();
+  const label = result?.category ? `[${result.category}] ` : '';
+  return result?.added === false
+    ? `建议或 BUG 已存在，跳过重复记录：${label}${text}`
+    : `记录改进建议 / BUG：${label}${text}`;
+}
+
+/** 模型没给昵称时，从本轮弹幕里按原文/内容包含关系反查提出者 */
+function findSuggestionPlayer(pending: ChatEvent[], original: string, content: string): string {
+  const pick = (text: string) => text.trim();
+  const targetOriginal = pick(original);
+  const targetContent = pick(content);
+  for (const ev of pending) {
+    const text = pick(ev.data.content);
+    if (!text) continue;
+    if (targetOriginal ? text === targetOriginal : targetContent.includes(text)) {
+      return normalizePlayerName(ev.user?.nickname);
+    }
+  }
+  if (targetOriginal) {
+    for (const ev of pending) {
+      if (pick(ev.data.content).includes(targetOriginal)) return normalizePlayerName(ev.user?.nickname);
+    }
+  }
+  return '';
 }
 
 /** 清理模型输出：去包裹引号、合并换行、截断到配置长度 */

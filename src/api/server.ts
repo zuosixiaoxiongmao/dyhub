@@ -62,6 +62,12 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     const body = (req.body ?? {}) as Record<string, unknown>;
     if (body.enabled !== undefined && typeof body.enabled !== 'boolean') return reply.code(400).send({ error: 'enabled 必须是布尔值' });
     if (body.knowledgeDir !== undefined && typeof body.knowledgeDir !== 'string') return reply.code(400).send({ error: 'knowledgeDir 必须是字符串' });
+    if (body.idleReplyEnabled !== undefined && typeof body.idleReplyEnabled !== 'boolean') return reply.code(400).send({ error: 'idleReplyEnabled 必须是布尔值' });
+    if (body.idleReplyIntervalSec !== undefined && typeof body.idleReplyIntervalSec !== 'number') return reply.code(400).send({ error: 'idleReplyIntervalSec 必须是数字' });
+    const idleMessages = body.idleReplyMessages;
+    if (idleMessages !== undefined && (!Array.isArray(idleMessages) || idleMessages.some((m) => typeof m !== 'string'))) {
+      return reply.code(400).send({ error: 'idleReplyMessages 必须是字符串数组' });
+    }
     try { return { ok: true, config: deps.aiAssistant.update(body as any) }; }
     catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }); }
   });
@@ -100,6 +106,22 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
     if (typeof query !== 'string' || !query.trim()) return reply.code(400).send({ error: 'query 必填' });
     const hits = await deps.aiAssistant.searchKnowledge(query, Math.max(1, Math.min(10, Math.floor(Number(limit) || 4))));
     return { hits };
+  });
+
+  // ---- 游戏改进建议：AI 通过 record_suggestion 工具写入 data/ai-suggestions.json ----
+  app.get('/api/ai-chat/suggestions', async (req) => {
+    const { roomId, limit } = req.query as { roomId?: string; limit?: string };
+    return { suggestions: deps.aiAssistant.listSuggestions(roomId, Number(limit) || 200) };
+  });
+  app.delete('/api/ai-chat/suggestions/:id', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'id 无效' });
+    if (!deps.aiAssistant.removeSuggestion(id)) return reply.code(404).send({ error: '建议不存在' });
+    return { ok: true };
+  });
+  app.delete('/api/ai-chat/suggestions', async (req) => {
+    const { roomId } = req.query as { roomId?: string };
+    return { ok: true, removed: deps.aiAssistant.clearSuggestions(roomId) };
   });
 
   // 调试面板：用一条模拟弹幕测试 AI 回复，不发送到直播间

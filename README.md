@@ -259,6 +259,8 @@ curl -X POST http://localhost:8757/api/webhooks \
 
 重复弹幕会被抑制：同一批里内容相同的只处理一次，处理过的内容在「重复弹幕忽略」窗口（默认 300 秒）内再次出现时直接跳过，不调用模型也不发送；同一观众一轮最多回复一条。窗口设为 `0` 可关闭去重。比较时会忽略空格、标点和大小写，因此「怎样玩？」和「怎样玩 ?」视为同一条。
 
+**定时回复**：控制台 AI 面板底部的「定时回复」可在直播间长时间无人发弹幕时自动发送预设话术，避免冷场。它独立于上面的自动回复开关，不调用模型；可设置静默时长（默认 300 秒）和话术列表（每行一条，按顺序轮换）。定时回复需要浏览器内核 + 已登录账号，轻量内核只能采集、不能发言。
+
 知识库目录默认是 `data/knowledge/`，可在控制台「知识库文档」里填绝对路径或相对运行目录的路径后点「应用目录」；部署时也可用 `DYHUB_KNOWLEDGE_DIR` 指定默认值。文档可直接在控制台新建 / 导入 / 编辑 / 删除，也可手工放进该目录。目录第一层建议包含 `README.md`（索引：每篇文档的文件名、书名和关键字）与 `00-回答规范.md`（统一回答格式）；`README.md` 缺失时会自动用文件名生成最小索引。控制台「试检索」仍使用本地中文二元词 + BM25，无需向量库；`KnowledgeRetriever` / `AgentTool` 接口预留了替换为向量检索、远程知识库或新增「订单查询」等工具的位置。
 
 **调试回复**：在控制台任意位置按 `F3`（或点 AI 面板的「调试 AI 回复」）打开调试面板。**每行一条**模拟弹幕，格式 `昵称：弹幕内容`（不写昵称时按「测试观众」处理），例如：
@@ -295,7 +297,7 @@ curl -X POST http://localhost:8757/api/webhooks \
 | DELETE | `/api/accounts/:id` | 删除账号 |
 | GET | `/api/events?types=chat,gift&roomId=xxx` | SSE 实时事件流 |
 | GET/POST/DELETE | `/api/webhooks` | Webhook 订阅管理 |
-| GET/PUT | `/api/ai-chat` | AI 管理员配置（开关 / 模型 / 间隔 / 回复字数 / 多条回复间隔 `replyIntervalMs` / 重复弹幕窗口 `duplicateWindowSec` / 知识库开关 / 工具轮数） |
+| GET/PUT | `/api/ai-chat` | AI 管理员配置（开关 / 模型 / 间隔 / 回复字数 / 多条回复间隔 `replyIntervalMs` / 重复弹幕窗口 `duplicateWindowSec` / 知识库开关 / 工具轮数 / 定时回复 `idleReplyEnabled`、`idleReplyIntervalSec`、`idleReplyMessages`） |
 | GET | `/api/ai-chat/logs` | 最近 AI 判断、工具调用与回复日志 |
 | WS | `/api/ai-chat/log-stream` | AI 实时日志流 |
 | GET/PUT | `/api/ai-chat/prompts[/:name]` | 人设提示词列表 / 保存 |

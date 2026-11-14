@@ -128,7 +128,7 @@ const MAX_DOC_READ_CHARS = 4000;
 /** 一次工具调用注入的文档总字符预算（agent.ts 会把工具结果截断到 12000 字符，留出 JSON 转义余量） */
 const MAX_DOC_READ_TOTAL_CHARS = 10_000;
 /** README 索引与回答规范的最大字符数 */
-const MAX_INDEX_CHARS = 4000;
+const MAX_INDEX_CHARS = 8000;
 const MAX_RULES_CHARS = 4000;
 
 /** 定时回复：静默检测周期；定时话术的条数与单条长度上限 */

@@ -6,7 +6,7 @@
  * 本模块不关心业务事件协议，只负责"拿到帧并解码"。
  */
 
-import type { Page, CDPSession, BrowserContext } from 'playwright-core';
+import type { Page, CDPSession, BrowserContext, Response } from 'playwright-core';
 import { decodeFrame, type RawProtoMessage } from '../proto/douyin.proto.js';
 import { parseRoomStatus } from './roomMeta.js';
 
@@ -26,6 +26,17 @@ export type LiveSessionStatus = 'connecting' | 'live' | 'closed';
 const CHAT_INPUT = '[data-e2e="live-chatting"] [data-slate-editor="true"][contenteditable="true"]';
 /** 同一房间两次发送的最小间隔，避免连发触发风控 */
 const CHAT_MIN_INTERVAL_MS = Number(process.env.DYHUB_CHAT_INTERVAL_MS ?? 3000);
+/** 等待抖音返回发送结果的超时时间 */
+const CHAT_SEND_TIMEOUT_MS = 12_000;
+/** 抖音网页端发送弹幕的接口 */
+const CHAT_SEND_PATH = '/webcast/room/chat/';
+
+/** 一次发送的结果：抖音是否真的接收了这条弹幕 */
+interface ChatSendOutcome {
+  ok: boolean;
+  /** 失败原因（抖音返回的提示 / 风控标记 / 超时） */
+  reason: string;
+}
 
 export class LiveSession {
   readonly roomId: string;
@@ -113,12 +124,15 @@ export class LiveSession {
     //    详见 parseRoomStatus 的注释；若未来发现误判，改为仅拒绝明确未开播的值。
     const roomStatus = await this.getRoomStatus();
     if (roomStatus != null && roomStatus !== 2) {
+      this.opts.onError?.(new Error(`直播间未开播（room.status=${roomStatus}）`));
       await this.stop(); // status='closed' + 关闭页面，避免 wss 帧再把状态翻成 live
       return false;
     }
-    // 2) 等待 wss 建立；wss 被关闭时提前退出，不必等满超时
+    // 2) 等待 wss 建立。弹幕 wss 在页面加载 / 切换清晰度时可能短暂断开后重连
+    //    （Network.webSocketClosed 会先把 status 置为 closed，重连帧再翻回 live），
+    //    因此不能在 closed 时立刻放弃，只有在会话被显式停止 / 页面关闭时才提前退出。
     const deadline = Date.now() + timeoutMs;
-    while (this.status === 'connecting' && Date.now() < deadline) {
+    while (!this.stopped && this.status !== 'live' && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500));
     }
     return this.status === 'live';
@@ -136,7 +150,8 @@ export class LiveSession {
   /**
    * 以登录账号在直播间发一条弹幕：在页面输入框里输入并回车，由页面自己完成签名与请求。
    * 多次调用排队执行，两条之间至少间隔 DYHUB_CHAT_INTERVAL_MS。
-   * 回车后输入框清空即视为页面已提交；是否真的发出由调用方等回显确认。
+   * 回车只代表页面尝试提交：未登录 / 风控拦截时页面同样会清空输入框，
+   * 所以必须等 /webcast/room/chat/ 返回 status_code=0 才算真的发出。
    */
   sendChat(text: string): Promise<void> {
     const run = this.sendQueue.then(() => this.doSendChat(text));
@@ -152,20 +167,77 @@ export class LiveSession {
     try {
       await input.waitFor({ state: 'visible', timeout: 5000 });
     } catch {
+      // 未登录时抖音会移除输入框，并在页面上提示「需先登录，才能开始聊天」
+      const walled = await this.page
+        .evaluate(() => document.body.innerText.includes('需先登录，才能开始聊天'))
+        .catch(() => false);
+      if (walled) throw new Error('账号未登录或登录已失效，请重新登录后再发送弹幕');
       throw new Error('找不到弹幕输入框（未登录，或抖音改版）');
     }
     await input.click();
     // 上一条没发出去时文字还留在输入框里，先删干净再输入，免得拼在一起或被页面补发
     await this.clearChatInput();
-    await this.page.keyboard.insertText(text);
-    await this.page.keyboard.press('Enter');
-    this.lastSentAt = Date.now();
-    await this.page.waitForTimeout(500);
-    if (await this.chatInputText()) {
-      // 没发出去：删掉，不让这段文字留在页面里
+    // 先开始监听再回车，避免响应比监听先到
+    const outcome = this.watchChatSend();
+    try {
+      await this.page.keyboard.insertText(text);
+      await this.page.keyboard.press('Enter');
+      this.lastSentAt = Date.now();
+      const result = await outcome.result;
+      if (!result.ok) {
+        // 没发出去：删掉，不让这段文字留在页面里
+        await this.clearChatInput().catch(() => {});
+        throw new Error(`抖音未接收弹幕：${result.reason}`);
+      }
+    } finally {
+      outcome.stop();
+    }
+    await this.page.waitForTimeout(300);
+    if (await this.chatInputText().catch(() => '')) {
       await this.clearChatInput().catch(() => {});
       throw new Error('回车后输入框未清空，弹幕可能未发出（风控 / 需验证 / 超出字数）');
     }
+  }
+
+  /**
+   * 监听本次回车触发的 /webcast/room/chat/ 响应。
+   * 抖音返回 status_code=0 才算成功；风控会带 bdturing-verify / shark_decision_conf，
+   * 需要人工过滑块验证，自动发送无法完成。
+   */
+  private watchChatSend(timeoutMs = CHAT_SEND_TIMEOUT_MS): { result: Promise<ChatSendOutcome>; stop(): void } {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let settle!: (outcome: ChatSendOutcome) => void;
+    const finish = (outcome: ChatSendOutcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      this.page.off('response', onResponse);
+      settle(outcome);
+    };
+    const onResponse = (res: Response) => {
+      if (!res.url().includes(CHAT_SEND_PATH)) return;
+      void (async () => {
+        let payload: any = null;
+        try { payload = await res.json(); } catch { /* 非 JSON：下面按响应异常处理 */ }
+        // 发送成功时抖音返回包含 msg_id / user 的 JSON；空响应或 HTML 都不能当成功
+        if (!payload) return finish({ ok: false, reason: `HTTP ${res.status()} 响应格式异常（发送结果无法确认）` });
+        const data = payload.data ?? {};
+        if (res.headers()['bdturing-verify'] || data.shark_decision_conf) {
+          return finish({ ok: false, reason: '抖音要求人机验证（风控拦截），请稍后重试或重新登录账号' });
+        }
+        const statusCode = Number(data.status_code ?? payload.status_code ?? 0);
+        if (!res.ok() || statusCode !== 0) {
+          const prompt = data.prompts || data.prompt || data.msg || payload.status_msg || payload.message || '';
+          return finish({ ok: false, reason: prompt ? String(prompt) : `HTTP ${res.status()} status_code=${statusCode}` });
+        }
+        finish({ ok: true, reason: '' });
+      })();
+    };
+    const result = new Promise<ChatSendOutcome>((resolve) => { settle = resolve; });
+    timer = setTimeout(() => finish({ ok: false, reason: '等待发送结果超时（未收到抖音响应）' }), timeoutMs);
+    this.page.on('response', onResponse);
+    return { result, stop: () => finish({ ok: false, reason: '会话已停止' }) };
   }
 
   /** 输入框里的文字；编辑器空时只剩零宽占位符，算作空 */

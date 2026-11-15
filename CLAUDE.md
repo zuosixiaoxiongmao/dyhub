@@ -66,7 +66,7 @@ docker compose up -d --build   # 一键启动（内置 Chromium + 中文字体�
 - **两种内核产出相同的 `RawProtoMessage`**，管道与分发层无感知。切换内核只需改 `DYHUB_COLLECTOR` 环境变量。
 - **轻量内核共享 cookie**（模块级 `sharedJar`，TTL 15min），多房间并发只跑一次 cookie 链，避免高频请求触发风控。`DYHUB_COOKIE` 环境变量可直接注入浏览器复制的 cookie，应用到默认账号，绕过 cookie 链请求（解决容器 IP 被风控）。
 - **多账号模型**（`accountStore.ts`）：每个账号 = 一个抖音登录态（cookie），持久化在 `data/accounts/{accountId}.json`。账号间互相隔离：浏览器内核为有 cookie 的账号创建独立 `BrowserContext`，轻量内核维护私有 cookie jar。连接房间时通过 `accountId` 指定账号，该房间使用此账号的 cookie。roomId 全局唯一：同一房间不能被多个账号同时订阅（`Collector.connect` 强制校验，返回 409）。订阅协议不变，仍只用 roomId。启动时自动迁移旧 `data/cookie.json`（→ 默认账号）和 `data/room-cookies/*.json`（→ 房间账号），旧文件备份为 `.bak`。
-- **发送弹幕**（`liveSession.ts`）：浏览器内核支持以登录账号发弹幕（`POST /api/rooms/:roomId/chat`），在页面输入框输入并回车，由页面自己签名与请求。同一房间排队发送，间隔见 `DYHUB_CHAT_INTERVAL_MS`。
+- **发送弹幕**（`liveSession.ts`）：浏览器内核支持以登录账号发弹幕（`POST /api/rooms/:roomId/chat`）。优先在页面里直接 `fetch GET /webcast/room/chat/`（长 room_id + content + `type=0`，由页面 webmssdk.js 自动加 msToken / a_bogus），不依赖 Slate 输入框；fetch 无响应时才回退到「输入框 + 回车」。同一房间排队发送，间隔见 `DYHUB_CHAT_INTERVAL_MS`。每次发送的接口原始返回记录在 `RoomInfo.stats.lastChat`，便于排查「接口成功但公屏没有」。
 - **直播流地址与截图**（`browser.ts` + `liveSession.ts`）：浏览器内核捕获播放器拉流地址（`GET /api/rooms/:roomId/stream`）和截取直播画面（`GET /api/rooms/:roomId/screenshot`），仅供展示与外部拉流。
 - **ESM 项目**（`"type": "module"`），所有内部 import 用 `.js` 扩展名（NodeNext moduleResolution 要求）。TypeScript 7 + Node ≥ 20。
 - **`long` 库处理 protobuf 64 位整数**，`longToStr()` 工具函数避免精度丢失，所有 id 字段用字符串。
@@ -99,4 +99,4 @@ docker compose up -d --build   # 一键启动（内置 Chromium + 中文字体�
 - `spike/` 为本地研究脚本（含真实抓包参数），已 gitignore，不入库。
 - Docker 部署需 `--shm-size=2g`（Chromium 渲染依赖共享内存），compose 已内置。
 - `DYHUB_HEADED` 仅当显式等于 `1`/`true` 时开有头；不能用 `!process.env.DYHUB_HEADED` 判断（字符串 `"0"`/`"false"` 也是 truthy）。
-- **不要用主播本人账号做采集/发言**：同一抖音账号在主播端进入自己的直播间后，浏览器内核里的网页登录态会被踢掉，发送弹幕报「账号未登录或登录已失效」；而且主播账号经网页发的弹幕不会回显给主播自己的其他客户端（观众能看到，主播看不到，容易误判成没发出去）。请用独立的观众小号登录，登录后断开房间重连才会生效。
+- **不要用主播本人账号做采集/发言**：同一抖音账号在主播端进入自己的直播间后，浏览器内核里的网页登录态会被踢掉，发送弹幕报「账号未登录或登录已失效」；而且主播账号经网页发的弹幕不会回显给主播自己的其他客户端（观众能看到，主播看不到，容易误判成没发出去）。请用独立的观众小号登录，登录后断开房间重连才会生效。`Collector` 会用账号 cookie 调 `live.douyin.com/webcast/user/me/` 取真实身份，`RoomInfo.selfAccount` 仅表示「账号与主播是同一个抖音号」，供展示/诊断用，不影响发送。

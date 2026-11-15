@@ -36,6 +36,8 @@ interface ChatSendOutcome {
   ok: boolean;
   /** 失败原因（抖音返回的提示 / 风控标记 / 超时） */
   reason: string;
+  /** 是否收到了抖音的接口响应（true 时不应再回退 DOM，直接按响应报错） */
+  responded?: boolean;
 }
 
 export class LiveSession {
@@ -57,6 +59,10 @@ export class LiveSession {
   /** 发送队列：同一页面一次只发一条 */
   private sendQueue: Promise<unknown> = Promise.resolve();
   private lastSentAt = 0;
+  /** 页面内 fetch 被抖音 403 拦过之后不再重试，直接走 DOM 发送 */
+  private fetchSendBlocked = false;
+  /** 最近一次发送弹幕的接口原始返回（用于排查「接口成功但公屏没有」） */
+  private lastChatResponse: { at: number; httpStatus: number; body: string; method: 'fetch' | 'dom' } | null = null;
 
   constructor(roomId: string, page: Page, cdp: CDPSession, opts: LiveSessionOptions, ownContext?: BrowserContext) {
     this.roomId = roomId;
@@ -163,6 +169,23 @@ export class LiveSession {
     if (this.stopped) throw new Error('会话已停止');
     const wait = this.lastSentAt + CHAT_MIN_INTERVAL_MS - Date.now();
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    this.lastSentAt = Date.now();
+
+    // 优先走页面内 fetch（与 kuaishou-live-mate 一致）：DOM 输入 + 回车依赖 Slate.js，
+    // 实测可能接口返回 msg_id、但弹幕不展示。fetch 由页面自己签名，不碰 DOM。
+    if (!this.fetchSendBlocked) {
+      const viaFetch = await this.sendChatViaFetch(text).catch((e): ChatSendOutcome => ({
+        ok: false,
+        reason: e instanceof Error ? e.message : String(e),
+      }));
+      if (viaFetch.ok) return;
+      // 抖音明确响应了 JSON 错误（风控 / 未登录 / 频率限制）→ 不再用 DOM 兜底掩盖问题
+      if (viaFetch.responded) throw new Error(`抖音未接收弹幕：${viaFetch.reason}`);
+      // 403 / 空响应：页面签名拦截对 fetch 不生效，本会话不再尝试 fetch
+      this.fetchSendBlocked = true;
+      console.warn(`[dyhub] fetch 发送弹幕不可用，后续改用 DOM：${viaFetch.reason}`);
+    }
+
     const input = this.page.locator(CHAT_INPUT);
     try {
       await input.waitFor({ state: 'visible', timeout: 5000 });
@@ -182,7 +205,6 @@ export class LiveSession {
     try {
       await this.page.keyboard.insertText(text);
       await this.page.keyboard.press('Enter');
-      this.lastSentAt = Date.now();
       const result = await outcome.result;
       if (!result.ok) {
         // 没发出去：删掉，不让这段文字留在页面里
@@ -200,9 +222,154 @@ export class LiveSession {
   }
 
   /**
+   * 在页面里直接 fetch 发送弹幕（参考 kuaishou-live-mate 的抖音实现）。
+   *
+   * 为什么要绕过 DOM：抖音输入框是 Slate.js，type + Enter 依赖编辑器事件，
+   * 实测会出现「接口返回 msg_id、但公屏不展示」；直接调真实接口由页面 webmssdk.js
+   * 自动给 fetch 加 msToken / a_bogus，最接近抖音自己的发送行为。
+   *
+   * 评论接口需要长 room_id（不是路径上的 web_rid），从页面 SSR 数据 / 已加载资源里提取。
+   */
+  private async sendChatViaFetch(text: string): Promise<ChatSendOutcome> {
+    const script = `
+      (async () => {
+        try {
+          const content = ${JSON.stringify(text)};
+          const addNum = (value, out) => {
+            const s = String(value || '').trim();
+            if (s && /^\\d{6,}$/.test(s)) out.push(s);
+          };
+          const pickRoomId = () => {
+            const candidates = [];
+            try { addNum(new URLSearchParams(location.search).get('room_id'), candidates); } catch (_) {}
+            try {
+              for (const id of ['__RENDER_DATA__', '__NEXT_DATA__']) {
+                const el = document.getElementById(id);
+                if (!el) continue;
+                const text = el.textContent || '';
+                const matches = text.matchAll(/"room_?id"\\s*[:=]\\s*"?\\d{10,}"?/g);
+                for (const m of matches) {
+                  const mm = m[0].match(/(\\d{10,})/);
+                  if (mm) addNum(mm[1], candidates);
+                }
+              }
+            } catch (_) {}
+            try { addNum(localStorage.getItem('roomId'), candidates); } catch (_) {}
+            try { addNum(localStorage.getItem('room_id'), candidates); } catch (_) {}
+            try {
+              const urls = performance.getEntriesByType('resource').map(e => e.name).filter(Boolean).reverse();
+              for (const rawUrl of urls) {
+                if (!rawUrl.includes('/webcast/')) continue;
+                try {
+                  const u = new URL(rawUrl, location.origin);
+                  addNum(u.searchParams.get('room_id'), candidates);
+                  const ext = u.searchParams.get('internal_ext') || '';
+                  const em = ext.match(/wss_push_room_id:(\\d+)/);
+                  if (em) addNum(em[1], candidates);
+                } catch (_) {}
+              }
+            } catch (_) {}
+            try {
+              const html = document.documentElement.innerHTML;
+              const matches = html.matchAll(/"room_?id"\\s*[:=]\\s*"?\\d{10,}"?/g);
+              for (const m of matches) {
+                const mm = m[0].match(/(\\d{10,})/);
+                if (mm) addNum(mm[1], candidates);
+              }
+            } catch (_) {}
+            try { addNum(window.__NEXT_DATA__ && window.__NEXT_DATA__.props && window.__NEXT_DATA__.props.pageProps && window.__NEXT_DATA__.props.pageProps.room && window.__NEXT_DATA__.props.pageProps.room.room_id, candidates); } catch (_) {}
+            try {
+              const pathMatch = location.pathname.match(/\\/(\\d+)/);
+              if (pathMatch) addNum(pathMatch[1], candidates);
+            } catch (_) {}
+            candidates.sort((a, b) => b.length - a.length);
+            return candidates[0] || '';
+          };
+
+          const roomId = pickRoomId();
+          if (!roomId) return { ok: false, error: '未找到 room_id' };
+
+          const chromePart = navigator.userAgent.split('Chrome/')[1] || '';
+          const browserVersion = chromePart.split(' ')[0] || '125.0.0.0';
+          const params = new URLSearchParams({
+            aid: '6383',
+            app_name: 'douyin_web',
+            live_id: '1',
+            device_platform: 'web',
+            language: 'zh-CN',
+            enter_from: 'web_live',
+            cookie_enabled: 'true',
+            screen_width: String(window.screen.width),
+            screen_height: String(window.screen.height),
+            browser_language: navigator.language,
+            browser_platform: navigator.platform,
+            browser_name: 'Chrome',
+            browser_version: browserVersion,
+            os_name: 'Windows',
+            os_version: '10',
+            room_id: roomId,
+            content: content,
+            type: '0',
+            rtf_content: '',
+            paste_edit_method: 'non_paste',
+          });
+
+          const resp = await fetch('/webcast/room/chat/?' + params.toString(), {
+            method: 'GET',
+            credentials: 'include',
+            headers: { accept: 'application/json, text/plain, */*' },
+          });
+          let bodyStr = '';
+          try { bodyStr = await resp.text(); } catch (_) {}
+          return { ok: resp.ok, status: resp.status, roomId: roomId, bodyStr: bodyStr.slice(0, 2000) };
+        } catch (e) {
+          return { ok: false, error: String(e) };
+        }
+      })()
+    `;
+
+    // 用字符串而不是回调函数：tsx(esbuild keepNames) 会给具名函数注入页面里不存在的 __name
+    const result: any = await this.page.evaluate(script);
+    const bodyStr: string = typeof result?.bodyStr === 'string' ? result.bodyStr : '';
+    if (result?.status) {
+      this.lastChatResponse = {
+        at: Date.now(),
+        httpStatus: Number(result.status) || 0,
+        body: bodyStr.slice(0, 1200),
+        method: 'fetch',
+      };
+      console.log(`[dyhub] 弹幕发送(fetch)返回 HTTP ${result.status}:`, bodyStr.slice(0, 500));
+    }
+    if (!result?.status) return { ok: false, reason: result?.error || 'fetch 发送失败' };
+
+    let payload: any = null;
+    try { payload = bodyStr ? JSON.parse(bodyStr) : null; } catch { /* 非 JSON */ }
+    // 403 / 空响应 = 抖音反爬没有接受这次 fetch，不代表发送失败，交给 DOM 兜底
+    if (!payload) return { ok: false, reason: `HTTP ${result.status} 响应为空或非 JSON`, responded: false };
+    const data = payload?.data ?? {};
+    const statusCode = data.status_code ?? payload?.status_code;
+    const msgId = data.msg_id ?? payload?.msg_id;
+    const failed =
+      !result.ok ||
+      (statusCode !== undefined && Number(statusCode) !== 0) ||
+      msgId === undefined ||
+      msgId === null ||
+      String(msgId) === '';
+    if (failed) {
+      const prompt = data.prompts || data.prompt || data.msg || payload?.status_msg || payload?.message || '';
+      return {
+        ok: false,
+        reason: prompt ? String(prompt) : `HTTP ${result.status} ${bodyStr.slice(0, 300)}`,
+        responded: true,
+      };
+    }
+    return { ok: true, reason: '', responded: true };
+  }
+
+  /**
    * 监听本次回车触发的 /webcast/room/chat/ 响应。
-   * 抖音返回 status_code=0 才算成功；风控会带 bdturing-verify / shark_decision_conf，
-   * 需要人工过滑块验证，自动发送无法完成。
+   * 实测成功返回里带 msg_id（没有 status_code 字段），以 msg_id 作为「抖音已收下」的凭据；
+   * 风控会带 bdturing-verify / shark_decision_conf，需要人工过滑块验证，自动发送无法完成。
    */
   private watchChatSend(timeoutMs = CHAT_SEND_TIMEOUT_MS): { result: Promise<ChatSendOutcome>; stop(): void } {
     let settled = false;
@@ -219,17 +386,36 @@ export class LiveSession {
       if (!res.url().includes(CHAT_SEND_PATH)) return;
       void (async () => {
         let payload: any = null;
-        try { payload = await res.json(); } catch { /* 非 JSON：下面按响应异常处理 */ }
+        let text = '';
+        try {
+          text = await res.text();
+          payload = text ? JSON.parse(text) : null;
+        } catch { /* 非 JSON：下面按响应异常处理 */ }
+        // 原样留底：排查「接口返回成功、公屏却没有」时需要看抖音真实的 status_code / prompt
+        this.lastChatResponse = { at: Date.now(), httpStatus: res.status(), body: (text || '').slice(0, 1200), method: 'dom' };
+        console.log(`[dyhub] 弹幕发送接口返回 (${res.status()}):`, (text || '').slice(0, 500));
         // 发送成功时抖音返回包含 msg_id / user 的 JSON；空响应或 HTML 都不能当成功
         if (!payload) return finish({ ok: false, reason: `HTTP ${res.status()} 响应格式异常（发送结果无法确认）` });
         const data = payload.data ?? {};
         if (res.headers()['bdturing-verify'] || data.shark_decision_conf) {
           return finish({ ok: false, reason: '抖音要求人机验证（风控拦截），请稍后重试或重新登录账号' });
         }
-        const statusCode = Number(data.status_code ?? payload.status_code ?? 0);
-        if (!res.ok() || statusCode !== 0) {
+        // 成功的实测返回形如 {"data":{"msg_id":…,"content":…,"user":{…}}}，没有 status_code；
+        // 不能把「没有 status_code」默认成成功，以 msg_id 作为成功凭据。
+        const statusCode = data.status_code ?? payload.status_code;
+        const msgId = data.msg_id ?? payload.msg_id;
+        const failed =
+          !res.ok() ||
+          (statusCode !== undefined && Number(statusCode) !== 0) ||
+          msgId === undefined ||
+          msgId === null ||
+          String(msgId) === '';
+        if (failed) {
           const prompt = data.prompts || data.prompt || data.msg || payload.status_msg || payload.message || '';
-          return finish({ ok: false, reason: prompt ? String(prompt) : `HTTP ${res.status()} status_code=${statusCode}` });
+          const detail = prompt
+            ? String(prompt)
+            : `HTTP ${res.status()}${statusCode !== undefined ? ` status_code=${statusCode}` : ''}，响应未包含 msg_id：${(text || '').slice(0, 300)}`;
+          return finish({ ok: false, reason: detail });
         }
         finish({ ok: true, reason: '' });
       })();
@@ -296,7 +482,12 @@ export class LiveSession {
     return this.page.screenshot({ type: 'jpeg', quality: 80, timeout: 10000, ...(clip ? { clip } : {}) });
   }
   stats() {
-    return { wsCount: this.wsCount, frameCount: this.frameCount, msgCount: this.msgCount };
+    return {
+      wsCount: this.wsCount,
+      frameCount: this.frameCount,
+      msgCount: this.msgCount,
+      lastChat: this.lastChatResponse,
+    };
   }
 
   async stop(): Promise<void> {

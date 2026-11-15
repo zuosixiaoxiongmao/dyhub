@@ -1184,13 +1184,18 @@ curl -X POST http://${base}/api/webhooks \\
       list.innerHTML = '<div class="empty" style="padding:12px;font-size:12px;">暂无账号，点击「新建」创建</div>';
     }
     for (const a of accounts) {
-      const dot = a.hasLogin ? '<span style="color:#2d7a4c;">●</span>' : a.hasCookie ? '<span style="color:#a8781a;">●</span>' : '<span style="color:#ccc;">○</span>';
+      // 有登录 cookie 不代表登录态仍有效：服务端已用 cookie 调抖音接口校验，取不到身份即已失效
+      const loginExpired = a.hasLogin && !a.profileUid && !a.profileNickname;
+      const dot = loginExpired ? '<span style="color:#b42318;">●</span>' : a.hasLogin ? '<span style="color:#2d7a4c;">●</span>' : a.hasCookie ? '<span style="color:#a8781a;">●</span>' : '<span style="color:#ccc;">○</span>';
+      const loginText = loginExpired
+        ? '<span style="color:#b42318;">登录已失效，请重新登录</span>'
+        : a.hasLogin ? '已登录' : a.hasCookie ? '游客 cookie' : '无 cookie';
       const item = document.createElement('div');
       item.className = 'room-item';
       const expHtml = a.cookieExpiresAt ? formatExpiry(a.cookieExpiresAt) : (a.hasCookie ? '<span style="color:var(--muted);">过期时间未知</span>' : '');
       item.innerHTML = `<div style="min-width:0;flex:1">
           <div class="r-head"><div class="r-info"><div class="r-name">${dot} ${escapeHtml(a.name)} ${a.name === '默认' ? '<span class="roompill">默认</span>' : ''}</div></div></div>
-          <div class="r-foot">${a.hasLogin ? '已登录' : a.hasCookie ? '游客 cookie' : '无 cookie'} ${expHtml}</div>
+          <div class="r-foot">${loginText}${a.profileNickname ? ` · 抖音身份：${escapeHtml(a.profileNickname)}` : a.profileUid ? ` · uid ${escapeHtml(a.profileUid)}` : ''} ${expHtml}</div>
         </div>
         <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end;">
           <div style="display:flex;gap:4px;">

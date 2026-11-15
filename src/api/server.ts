@@ -11,6 +11,7 @@ import fastifyStatic from '@fastify/static';
 import { Collector, RoomActionError } from '../collector/collector.js';
 import * as accountStore from '../collector/accountStore.js';
 import * as loginWindow from '../collector/loginWindow.js';
+import { fetchAccountProfile } from '../collector/accountProfile.js';
 import { EventBus } from '../pipeline/eventBus.js';
 import { WebhookDispatcher } from '../dispatch/webhook.js';
 import { registerSseRoute } from '../dispatch/sseServer.js';
@@ -151,7 +152,17 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
   });
 
   // ---- 账号管理（多账号隔离，每个账号独立 cookie）----
-  app.get('/api/accounts', async () => ({ accounts: accountStore.listAccountStatuses() }));
+  // 除账号名（用户自己起的标签）外，额外返回 cookie 对应的抖音真实身份，
+  // 避免「账号名写成主播名」让人误以为登录的就是那个号。
+  app.get('/api/accounts', async () => ({
+    accounts: await Promise.all(
+      accountStore.listAccountStatuses().map(async (a) => {
+        const cookie = accountStore.getAccountCookieStr(a.id);
+        const profile = cookie ? await fetchAccountProfile(cookie) : null;
+        return { ...a, profileUid: profile?.uid ?? '', profileNickname: profile?.nickname ?? '' };
+      }),
+    ),
+  }));
 
   app.post('/api/accounts', async (req, reply) => {
     const { name } = (req.body ?? {}) as { name?: string };

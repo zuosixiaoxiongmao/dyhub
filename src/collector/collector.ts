@@ -12,15 +12,25 @@ import { BrowserManager } from './browser.js';
 import { LiveSession } from './liveSession.js';
 import { fetchRoomMeta } from './roomMeta.js';
 import type { RoomMeta } from './roomMeta.js';
+import { fetchAccountProfile } from './accountProfile.js';
 import type { RawProtoMessage } from '../proto/douyin.proto.js';
 import * as accountStore from './accountStore.js';
+
+/** 最近一次发弹幕的接口原始返回，用于排查「接口成功但公屏没有」 */
+export interface ChatSendDebug {
+  at: number;
+  httpStatus: number;
+  body: string;
+  /** fetch = 页面内直接调接口；dom = 输入框 + 回车兜底 */
+  method: 'fetch' | 'dom';
+}
 
 /** 采集会话的统一形状（LiveSession / LightweightSession 都实现） */
 export interface SessionLike {
   roomId: string;
   status: string;
   startedAt: number;
-  stats(): { wsCount: number; frameCount: number; msgCount: number };
+  stats(): { wsCount: number; frameCount: number; msgCount: number; lastChat?: ChatSendDebug | null };
   start?(): void;
   stop(): Promise<void>;
   waitForLive(timeoutMs?: number): Promise<boolean>;
@@ -40,7 +50,7 @@ export interface RoomInfo {
   roomId: string;
   status: string;
   startedAt: number;
-  stats: { wsCount: number; frameCount: number; msgCount: number };
+  stats: { wsCount: number; frameCount: number; msgCount: number; lastChat?: ChatSendDebug | null };
   error?: string;
   /** 主播信息（异步补全，可能为空） */
   meta?: RoomMeta | null;
@@ -48,6 +58,8 @@ export interface RoomInfo {
   progress?: { step: string; detail?: string; ts: number };
   /** 所属账号 ID */
   accountId?: string;
+  /** 该房间使用的账号是否与主播是同一个抖音号（仅用于展示/诊断，不影响发送） */
+  selfAccount?: boolean;
 }
 
 /** 连接进度步骤 */
@@ -83,6 +95,8 @@ export class Collector {
   private connecting = new Map<string, Promise<RoomInfo>>();
   /** roomId → accountId 映射，保证同一房间不会被多个账号同时订阅 */
   private roomAccounts = new Map<string, string>();
+  /** roomId → 该房间是否正在使用主播本人账号（身份未知时不写入） */
+  private selfAccount = new Map<string, boolean>();
   private readonly browser?: BrowserManager;
   private readonly createSession?: (roomId: string, cookie?: string) => SessionLike;
   private readonly onMessage: CollectorOptions['onMessage'];
@@ -163,8 +177,11 @@ export class Collector {
       this.progress.set(roomId, { step, detail, ts: Date.now() });
 
     setProgress('launching');
+    this.selfAccount.delete(roomId);
     // 确定本房间使用的 cookie：来自绑定账号的 cookie
     const cookie = accountStore.getAccountCookieStr(accountId) || undefined;
+    // 识别「账号 == 主播本人」：先预热身份缓存，等主播信息就绪后再比对
+    void this.detectSelfAccount(roomId, accountId);
     const session = this.createSession
       ? this.createSession(roomId, cookie)
       : await this.createBrowserSession(roomId, cookie);
@@ -179,12 +196,14 @@ export class Collector {
       const m = session.meta;
       if (m) {
         this.metas.set(roomId, m);
+        void this.detectSelfAccount(roomId, accountId);
         return;
       }
       fetchRoomMeta(roomId).then((meta) => {
         if (!this.sessions.has(roomId)) return;
         if (meta) {
           this.metas.set(roomId, meta);
+          void this.detectSelfAccount(roomId, accountId);
         } else if (attempt < 5) {
           setTimeout(() => ensureMeta(attempt + 1), 30_000);
         }
@@ -248,6 +267,29 @@ export class Collector {
     return Boolean(s && s.status === 'live' && s.sendChat);
   }
 
+  /** 该房间是否已确认在使用主播本人账号（身份未知时返回 false） */
+  isSelfAccount(roomId: string): boolean {
+    return this.selfAccount.get(roomId) === true;
+  }
+
+  /**
+   * 查询账号身份并与主播 uid 比对。info 取不到时保持「未知」，不阻断发送。
+   * 账号在请求返回前被换掉 / 房间已断开时丢弃结果。
+   */
+  private async detectSelfAccount(roomId: string, accountId: string): Promise<void> {
+    const cookie = accountStore.getAccountCookieStr(accountId);
+    if (!cookie) return;
+    const profile = await fetchAccountProfile(cookie);
+    if (this.roomAccounts.get(roomId) !== accountId) return;
+    const meta = this.metas.get(roomId);
+    if (!profile || !meta?.uid) return;
+    const isSelf = profile.uid === meta.uid;
+    this.selfAccount.set(roomId, isSelf);
+    if (isSelf) {
+      console.log(`[dyhub] 房间 ${roomId} 使用的账号与主播是同一个抖音号（${profile.nickname || profile.uid}）`);
+    }
+  }
+
   /** 直播间正在播放的流地址，播放器还没请求时为 null */
   getStreamUrl(roomId: string): string | null {
     return this.liveSession(roomId, 'streamUrl', '获取直播流').streamUrl!();
@@ -285,6 +327,7 @@ export class Collector {
     this.errors.delete(roomId);
     this.progress.delete(roomId);
     this.roomAccounts.delete(roomId);
+    this.selfAccount.delete(roomId);
   }
 
   /** 彻底删除一个房间（含已停止保留的记录），房间从列表消失 */
@@ -300,6 +343,7 @@ export class Collector {
     this.metas.delete(roomId);
     this.progress.delete(roomId);
     this.roomAccounts.delete(roomId);
+    this.selfAccount.delete(roomId);
     this.lastStatus.delete(roomId);
   }
 
@@ -321,6 +365,7 @@ export class Collector {
         meta: this.metas.has(roomId) ? this.metas.get(roomId) : undefined,
         progress: this.progress.get(roomId),
         accountId: this.roomAccounts.get(roomId),
+        selfAccount: this.selfAccount.get(roomId),
       };
     }
     const saved = this.saved.get(roomId);

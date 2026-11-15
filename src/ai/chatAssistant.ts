@@ -115,6 +115,8 @@ const DEFAULT_REPLY_INTERVAL_MS = (() => {
 })();
 /** 单轮最多回复多少个观众，防止模型输出过多条目刷屏 */
 const MAX_REPLIES_PER_ROUND = 10;
+/** AI 自己发出的弹幕在多久内可能从公屏回显（用于识别并丢弃自己的回显） */
+const SELF_ECHO_TTL_MS = 120_000;
 
 // ---- 知识库索引 / 文档读取 ----
 /** README 索引文件名：列出每个知识文档的书名与关键字，第一次请求时附带 */
@@ -186,8 +188,14 @@ export class ChatAssistant {
   private running = new Set<string>();
   private pending = new Map<string, ChatEvent[]>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** 各房间最近已处理的弹幕内容签名 → 过期时间，用于抑制重复弹幕 */
+  /** 各房间「观众 + 内容签名」→ 过期时间，用于抑制同一观众反复刷同一句 */
   private handledChats = new Map<string, Map<string, number>>();
+  /** 各房间上一次记录「主播本人弹幕被忽略」的时间，避免主播正常聊天时刷屏 */
+  private anchorNoticeAt = new Map<string, number>();
+  /** 各房间 AI 自己发出的弹幕签名 → 过期时间，用于识别公屏回显（见 SELF_ECHO_TTL_MS） */
+  private selfSent = new Map<string, Map<string, number>>();
+  /** 各房间上一次提示「AI 正在用主播账号发言」的时间 */
+  private anchorAccountNoticeAt = new Map<string, number>();
   /** 各房间最近一条非空弹幕的接收时间（毫秒），用于静默计时 */
   private idleLastChatAt = new Map<string, number>();
   /** 各房间下一条定时话术的序号 */
@@ -233,8 +241,28 @@ export class ChatAssistant {
       // 用接收时间而不是发送时间，避免机器时钟偏差让计时永远不满足。
       if (text) this.idleLastChatAt.set(ev.roomId, Math.min(ev.receivedAt || ev.ts || Date.now(), Date.now()));
       if (!text || !this.config.enabled) return;
-      // 主播自己的发言不进入 AI 上下文，也不触发回复，避免直播间出现“主播自答自话”
-      if (isAnchorChatEvent(ev, this.collector.getRoomInfo(ev.roomId)?.meta)) return;
+      const meta = this.collector.getRoomInfo(ev.roomId)?.meta;
+      // AI 自己发出的弹幕会从公屏回显。它既不是观众的新问题，也不该被当成主播发言：
+      // 如果当普通弹幕处理，AI 会回复自己（账号是观众时）或误报“主播本人弹幕被忽略”
+      // （账号是主播时）。直接丢弃，只保留一条“正在用主播账号发言”的提示。
+      if (this.isOwnEcho(ev.roomId, text)) {
+        if (isAnchorChatEvent(ev, meta)) this.noticeAnchorAccount(ev.roomId, meta);
+        return;
+      }
+      // 主播自己的发言不进入 AI 上下文，也不触发回复，避免直播间出现“主播自答自话”。
+      // 但要在日志里留一条提示：否则用主播账号测试时会完全看不到任何 AI 日志，
+      // 容易误判成“弹幕没进 AI / 接口坏了”。同房间最多每分钟提示一次，避免刷屏。
+      if (isAnchorChatEvent(ev, meta)) {
+        const now = Date.now();
+        if (now - (this.anchorNoticeAt.get(ev.roomId) ?? 0) > 60_000) {
+          this.anchorNoticeAt.set(ev.roomId, now);
+          this.log({
+            roomId: ev.roomId, status: 'skipped', inputCount: 1, output: text.slice(0, 60),
+            message: '主播本人弹幕不会触发 AI 回复（如需测试请换一个观众账号发送）',
+          });
+        }
+        return;
+      }
       const list = this.recent.get(ev.roomId) ?? [];
       list.push(ev); if (list.length > 100) list.shift(); this.recent.set(ev.roomId, list);
       const pending = this.pending.get(ev.roomId) ?? [];
@@ -321,7 +349,9 @@ export class ChatAssistant {
   clearSuggestions(roomId?: string): number { return this.suggestions.clear(roomId); }
 
   /**
-   * 过滤重复弹幕：同一批内相同内容只保留第一条，并跳过最近已处理过的相同内容。
+   * 过滤重复弹幕：同一批内同一观众的相同内容只保留第一条，并跳过最近已处理过的
+   * 同一位观众的相同内容。不同观众问同一个问题不算重复——直播间里新人反复问
+   * “怎么加入”很常见，按内容全局去重会让除第一个之外的所有观众都收不到回复。
    * 返回 fresh（需要处理）和 duplicates（被忽略的条数）。
    */
   private filterDuplicateChats(roomId: string, pending: ChatEvent[]): { fresh: ChatEvent[]; duplicates: number } {
@@ -338,7 +368,7 @@ export class ChatAssistant {
     const fresh: ChatEvent[] = [];
     let duplicates = 0;
     for (const ev of pending) {
-      const key = chatSignature(ev.data.content);
+      const key = chatKey(ev);
       if (key && (cache?.has(key) || seen.has(key))) {
         duplicates++;
         continue;
@@ -349,7 +379,7 @@ export class ChatAssistant {
     return { fresh, duplicates };
   }
 
-  /** 记录本轮已处理的弹幕内容，在 duplicateWindowSec 窗口内不再重复处理 */
+  /** 记录本轮已处理的弹幕，在 duplicateWindowSec 窗口内同一观众不再重复处理 */
   private markHandledChats(roomId: string, events: ChatEvent[]) {
     if (this.config.duplicateWindowSec <= 0 || !events.length) return;
     let cache = this.handledChats.get(roomId);
@@ -359,7 +389,7 @@ export class ChatAssistant {
     }
     const expiresAt = Date.now() + this.config.duplicateWindowSec * 1000;
     for (const ev of events) {
-      const key = chatSignature(ev.data.content);
+      const key = chatKey(ev);
       if (key) cache.set(key, expiresAt);
     }
     // 防止长期运行后单房间缓存无限增长
@@ -368,6 +398,60 @@ export class ChatAssistant {
       if (oldest === undefined) break;
       cache.delete(oldest);
     }
+  }
+
+  /**
+   * 记住一条即将发出的弹幕内容。抖音会把发出的弹幕从公屏推回来，
+   * 需要在发送前登记，回显到达时才能识别为“自己发的”。
+   */
+  private rememberOwnChat(roomId: string, content: string) {
+    const key = chatSignature(content);
+    if (!key) return;
+    const now = Date.now();
+    let cache = this.selfSent.get(roomId);
+    if (!cache) {
+      cache = new Map();
+      this.selfSent.set(roomId, cache);
+    }
+    cache.set(key, now + SELF_ECHO_TTL_MS);
+    for (const [item, expiresAt] of cache) {
+      if (expiresAt <= now) cache.delete(item);
+    }
+  }
+
+  /** 发送失败时撤掉登记，避免把观众随后发的相同内容误当成自己的回显 */
+  private forgetOwnChat(roomId: string, content: string) {
+    const key = chatSignature(content);
+    if (key) this.selfSent.get(roomId)?.delete(key);
+  }
+
+  /** 这条弹幕是否就是 AI 刚发出、又被公屏推回来的那条 */
+  private isOwnEcho(roomId: string, content: string): boolean {
+    const key = chatSignature(content);
+    if (!key) return false;
+    const cache = this.selfSent.get(roomId);
+    const expiresAt = cache?.get(key);
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= Date.now()) {
+      cache!.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * AI 用主播本人账号发言时提示一次：弹幕在公屏上显示的是主播昵称，
+   * 主播自己在开播端 / 同账号的其他设备上往往看不到，容易被误判成“没发出去”。
+   */
+  private noticeAnchorAccount(roomId: string, meta: RoomMeta | null | undefined) {
+    const now = Date.now();
+    if (now - (this.anchorAccountNoticeAt.get(roomId) ?? 0) < 10 * 60_000) return;
+    this.anchorAccountNoticeAt.set(roomId, now);
+    const who = meta?.nickname?.trim() || '主播本人';
+    this.log({
+      roomId, status: 'tool',
+      message: `AI 回复使用的是主播本人账号，公屏显示为「${who}」。建议登录一个观众小号并重新连接房间，AI 发言才会独立显示。`,
+    });
   }
 
   /**
@@ -400,7 +484,7 @@ export class ChatAssistant {
       const ev = recent[i];
       if (meta && isAnchorChatEvent(ev, meta)) continue;
       const key = chatSignature(ev.data.content);
-      if (!key || isHandled(key) || freshKeys.has(key) || seen.has(key)) continue;
+      if (!key || isHandled(chatKey(ev)) || freshKeys.has(key) || seen.has(key)) continue;
       seen.add(key);
       kept.push(ev);
     }
@@ -451,7 +535,7 @@ export class ChatAssistant {
     if (!fresh.length) {
       this.log({
         roomId, status: 'skipped', inputCount: batch.length,
-        message: `本轮 ${batch.length} 条弹幕均为重复或 ${c.duplicateWindowSec} 秒内已处理，已忽略`,
+        message: `本轮 ${batch.length} 条弹幕均为重复或 ${c.duplicateWindowSec} 秒内已处理，已忽略${formatChatPreview(batch)}`,
       });
       return;
     }
@@ -478,7 +562,7 @@ export class ChatAssistant {
         this.markHandledChats(roomId, fresh);
         this.log({
           roomId, status: 'skipped', inputCount: batch.length, output: composed.raw,
-          message: composed.skipReason === 'empty' ? '未生成有效回复' : '判断无需回复',
+          message: `${composed.skipReason === 'empty' ? '未生成有效回复' : '判断无需回复'}${formatChatPreview(fresh)}`,
           sources: composed.sources, steps: composed.steps,
         });
         return;
@@ -503,6 +587,8 @@ export class ChatAssistant {
           break;
         }
         const label = item.player ? `回复观众「${item.player}」` : '发送回复';
+        // 先登记再发送：公屏回显可能比抖音接口响应更早到
+        this.rememberOwnChat(roomId, item.content);
         try {
           await this.collector.sendChat(roomId, item.content);
           sentAny = true;
@@ -514,6 +600,7 @@ export class ChatAssistant {
             sources: composed.sources, steps: composed.steps,
           });
         } catch (e) {
+          this.forgetOwnChat(roomId, item.content);
           const message = e instanceof Error ? e.message : String(e);
           this.log({
             roomId, status: 'error', inputCount: batch.length, output: item.content,
@@ -592,6 +679,7 @@ export class ChatAssistant {
       // 先重置计时：即使发送失败，也要等下一个完整静默周期再重试，避免每 10 秒刷一次
       this.idleLastChatAt.set(roomId, now);
       this.idleCursor.set(roomId, (index + 1) % c.idleReplyMessages.length);
+      this.rememberOwnChat(roomId, text);
       try {
         await this.collector.sendChat(roomId, text);
         const minutes = Math.max(1, Math.round(c.idleReplyIntervalSec / 60));
@@ -600,6 +688,7 @@ export class ChatAssistant {
           message: `直播间 ${minutes} 分钟无弹幕，发送定时回复（${index + 1}/${c.idleReplyMessages.length}）`,
         });
       } catch (e) {
+        this.forgetOwnChat(roomId, text);
         const message = e instanceof Error ? e.message : String(e);
         this.log({ roomId, status: 'error', output: text, message: `定时回复发送失败：${message}` });
         console.error(`[dyhub] 定时回复发送失败 (${roomId}):`, message);
@@ -1227,6 +1316,30 @@ function isAnchorChatEvent(ev: ChatEvent, meta: RoomMeta | null | undefined): bo
   if (meta.secUid && secUid) return meta.secUid === secUid;
   const nickname = ev.user.nickname?.trim();
   return Boolean(meta.nickname && nickname && meta.nickname.trim() === nickname);
+}
+
+/**
+ * 去重键：观众身份 + 归一化内容。
+ * 只有同一观众反复刷同一句才算重复；不同观众问同样的问题要分别处理。
+ */
+function chatKey(ev: ChatEvent): string {
+  const signature = chatSignature(ev.data.content);
+  if (!signature) return '';
+  const who = String(ev.user?.id ?? '').trim() || normalizePlayerName(ev.user?.nickname) || '匿名';
+  return JSON.stringify([who, signature]);
+}
+
+/** 日志里附带本轮弹幕原文（截断），方便回溯“为什么没回复” */
+function formatChatPreview(events: ChatEvent[], maxItems = 5, maxChars = 40): string {
+  if (!events.length) return '';
+  const items = events.slice(-maxItems).map((ev) => {
+    const name = normalizePlayerName(ev.user?.nickname) || '观众';
+    const content = ev.data.content.trim().replace(/\s+/g, ' ');
+    const clipped = content.length > maxChars ? `${content.slice(0, maxChars)}…` : content;
+    return `${name}：${clipped}`;
+  });
+  const rest = events.length > maxItems ? ` 等 ${events.length} 条` : '';
+  return `（${items.join('；')}${rest}）`;
 }
 
 /**

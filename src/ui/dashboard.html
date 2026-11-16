@@ -273,7 +273,7 @@
           <summary style="font-size:12px;font-weight:600;cursor:pointer;">定时回复（长时间无人发言时自动发弹幕）</summary>
           <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin:8px 0 6px;"><input id="aiIdleEnabled" type="checkbox" />启用定时回复</label>
           <label style="font-size:11px;">无弹幕多久后发送（秒）<input id="aiIdleIntervalSec" type="number" min="30" max="86400" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;margin-top:4px;" /></label>
-          <div style="font-size:10px;color:var(--muted);margin:6px 0 4px;">定时话术（每行一条，按顺序轮换发送，最多 50 条）</div>
+          <div style="font-size:10px;color:var(--muted);margin:6px 0 4px;">定时话术（每行一条，每次随机发送一条，最多 50 条）</div>
           <textarea id="aiIdleMessages" rows="4" placeholder="每行一条话术，例如：欢迎来到直播间～" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:7px;resize:vertical;margin-bottom:6px;"></textarea>
           <div style="font-size:10px;color:var(--muted);">与「启用管理员自动回复」相互独立，不调用模型；需要浏览器内核 + 已登录账号（轻量内核只能采集，不能发弹幕）。</div>
         </details>

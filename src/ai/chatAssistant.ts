@@ -49,7 +49,7 @@ export interface AiConfig {
   idleReplyEnabled: boolean;
   /** 弹幕静默多少秒后发送定时回复 */
   idleReplyIntervalSec: number;
-  /** 定时回复话术，按顺序轮换 */
+  /** 定时回复话术，每行一条，每次随机选一条发送 */
   idleReplyMessages: string[];
 }
 
@@ -198,8 +198,8 @@ export class ChatAssistant {
   private anchorAccountNoticeAt = new Map<string, number>();
   /** 各房间最近一条非空弹幕的接收时间（毫秒），用于静默计时 */
   private idleLastChatAt = new Map<string, number>();
-  /** 各房间下一条定时话术的序号 */
-  private idleCursor = new Map<string, number>();
+  /** 各房间上一条定时话术，随机选择时用来避免连续发同一句 */
+  private idleLastMessage = new Map<string, string>();
   private idleTimer: ReturnType<typeof setInterval> | null = null;
   private logs: AiLog[] = [];
   private nextLogId = 1;
@@ -631,7 +631,7 @@ export class ChatAssistant {
     }
   }
 
-  // ---- 定时回复：直播间长时间无弹幕时轮换发送预设话术（不调用模型） ----
+  // ---- 定时回复：直播间长时间无弹幕时随机发送一条预设话术（不调用模型） ----
 
   private startIdleTicker() {
     if (this.idleTimer) return;
@@ -655,11 +655,11 @@ export class ChatAssistant {
     if (!c.idleReplyEnabled || !c.idleReplyMessages.length) return;
     const now = Date.now();
     const rooms = new Map(this.collector.getRooms().map((room) => [room.roomId, room]));
-    // 房间已删除 / 已停止：清理计时与轮换状态，避免长期运行后 Map 无限增长
+    // 房间已删除 / 已停止：清理计时与话术状态，避免长期运行后 Map 无限增长
     for (const id of [...this.idleLastChatAt.keys()]) {
       if (rooms.get(id)?.status !== 'live') {
         this.idleLastChatAt.delete(id);
-        this.idleCursor.delete(id);
+        this.idleLastMessage.delete(id);
       }
     }
     for (const room of rooms.values()) {
@@ -674,18 +674,22 @@ export class ChatAssistant {
       // AI 正在逐条回复时不要插话；它的发言会自然重置静默计时
       if (this.running.has(roomId)) continue;
 
-      const index = (this.idleCursor.get(roomId) ?? 0) % c.idleReplyMessages.length;
-      const text = c.idleReplyMessages[index];
+      // 每次从话术里随机抽一条；多于一条时排除上一条，避免连续两次发同一句
+      const previous = this.idleLastMessage.get(roomId);
+      const pool = c.idleReplyMessages.length > 1
+        ? c.idleReplyMessages.filter((item) => item !== previous)
+        : c.idleReplyMessages;
+      const text = pool[Math.floor(Math.random() * pool.length)];
       // 先重置计时：即使发送失败，也要等下一个完整静默周期再重试，避免每 10 秒刷一次
       this.idleLastChatAt.set(roomId, now);
-      this.idleCursor.set(roomId, (index + 1) % c.idleReplyMessages.length);
+      this.idleLastMessage.set(roomId, text);
       this.rememberOwnChat(roomId, text);
       try {
         await this.collector.sendChat(roomId, text);
         const minutes = Math.max(1, Math.round(c.idleReplyIntervalSec / 60));
         this.log({
           roomId, status: 'idle', output: text,
-          message: `直播间 ${minutes} 分钟无弹幕，发送定时回复（${index + 1}/${c.idleReplyMessages.length}）`,
+          message: `直播间 ${minutes} 分钟无弹幕，随机发送定时回复（共 ${c.idleReplyMessages.length} 条话术）`,
         });
       } catch (e) {
         this.forgetOwnChat(roomId, text);

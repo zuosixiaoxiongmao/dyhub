@@ -14,6 +14,7 @@ import { fetchRoomMeta } from './roomMeta.js';
 import type { RoomMeta } from './roomMeta.js';
 import { fetchAccountProfile } from './accountProfile.js';
 import type { RawProtoMessage } from '../proto/douyin.proto.js';
+import type { RoomWarning } from '../types/events.js';
 import * as accountStore from './accountStore.js';
 
 /** 最近一次发弹幕的接口原始返回，用于排查「接口成功但公屏没有」 */
@@ -28,6 +29,7 @@ export interface ChatSendDebug {
 /** 采集会话的统一形状（LiveSession / LightweightSession 都实现） */
 export interface SessionLike {
   roomId: string;
+  webcastRoomId?: string;
   status: string;
   startedAt: number;
   stats(): { wsCount: number; frameCount: number; msgCount: number; lastChat?: ChatSendDebug | null };
@@ -60,6 +62,8 @@ export interface RoomInfo {
   accountId?: string;
   /** 该房间使用的账号是否与主播是同一个抖音号（仅用于展示/诊断，不影响发送） */
   selfAccount?: boolean;
+  /** 看门狗写入的告警（登录失效 / 疑似收不到礼物），持续到恢复或断开 */
+  warning?: RoomWarning;
 }
 
 /** 连接进度步骤 */
@@ -74,6 +78,8 @@ export interface CollectorOptions {
   onMessage: (msg: RawProtoMessage, meta: { roomId: string }) => void;
   /** 房间状态变更回调（由上层 index.ts 接线，发布 RoomStatusEvent 到 EventBus） */
   onStatusChange?: (roomId: string, status: string, error?: string) => void;
+  /** 看门狗告警变更回调（由上层 index.ts 接线，发布 RoomWarningEvent 到 EventBus） */
+  onWarningChange?: (roomId: string, warning: RoomWarning, cleared: boolean, reason?: string) => void;
 }
 
 /** 房间操作（发弹幕 / 取流地址 / 截图）失败，带建议的 HTTP 状态码 */
@@ -97,10 +103,13 @@ export class Collector {
   private roomAccounts = new Map<string, string>();
   /** roomId → 该房间是否正在使用主播本人账号（身份未知时不写入） */
   private selfAccount = new Map<string, boolean>();
+  /** roomId → 看门狗告警；由 Watchdog 写入，getRoomInfo 直接带出 */
+  private warnings = new Map<string, RoomWarning>();
   private readonly browser?: BrowserManager;
   private readonly createSession?: (roomId: string, cookie?: string) => SessionLike;
   private readonly onMessage: CollectorOptions['onMessage'];
   private readonly onStatusChange?: CollectorOptions['onStatusChange'];
+  private readonly onWarningChange?: CollectorOptions['onWarningChange'];
   /** 每房间上次已知状态，用于轮询去重 */
   private lastStatus = new Map<string, string>();
   /** 状态轮询定时器（2s 检测会话内部状态变更，如 wss 断开 / 页面关闭） */
@@ -111,6 +120,7 @@ export class Collector {
     this.createSession = opts.createSession;
     this.onMessage = opts.onMessage;
     this.onStatusChange = opts.onStatusChange;
+    this.onWarningChange = opts.onWarningChange;
     if (this.onStatusChange) {
       this.statusTimer = setInterval(() => this.pollStatuses(), 2000);
     }
@@ -125,6 +135,10 @@ export class Collector {
   async connect(roomId: string, opts?: { accountId?: string }): Promise<RoomInfo> {
     const accountId = opts?.accountId ?? accountStore.getDefaultAccountId();
     if (!accountId) throw new RoomActionError('没有可用的账号，请先在控制台创建', 400);
+    // 显式指定了账号但账号不存在：拒绝连接，避免静默降级为匿名上下文（只收弹幕、不收礼物）
+    if (opts?.accountId && !accountStore.getAccount(opts.accountId)) {
+      throw new RoomActionError(`账号 ${opts.accountId} 不存在，请重新选择账号`, 400);
+    }
 
     const existingAccount = this.roomAccounts.get(roomId);
 
@@ -173,6 +187,8 @@ export class Collector {
       this.saved.delete(roomId);
       this.metas.set(roomId, s.meta);
     }
+    // 新会话不继承旧账号的告警（由看门狗重新探测后写入）
+    this.warnings.delete(roomId);
     const setProgress = (step: ConnectStep, detail?: string) =>
       this.progress.set(roomId, { step, detail, ts: Date.now() });
 
@@ -239,9 +255,10 @@ export class Collector {
   private async createBrowserSession(roomId: string, cookie?: string): Promise<SessionLike> {
     if (!this.browser) throw new Error('未配置浏览器内核（DYHUB_COLLECTOR=browser 时需要 DYHUB_CHROME）');
     const url = `https://live.douyin.com/${roomId}`;
-    const { page, cdp, context, streamUrl } = await this.browser.openRoom(url, { cookie });
+    const { page, cdp, context, streamUrl, webcastRoomId } = await this.browser.openRoom(url, { cookie });
     const session = new LiveSession(roomId, page, cdp, {
       streamUrl,
+      webcastRoomId,
       onMessage: (msg, meta) => this.onMessage(msg, meta),
       // 弹幕通道（重新）建立：清掉之前的断开错误
       onOpen: () => {
@@ -270,6 +287,33 @@ export class Collector {
   /** 该房间是否已确认在使用主播本人账号（身份未知时返回 false） */
   isSelfAccount(roomId: string): boolean {
     return this.selfAccount.get(roomId) === true;
+  }
+
+  /** 当前房间告警（无则 undefined） */
+  getWarning(roomId: string): RoomWarning | undefined {
+    return this.warnings.get(roomId);
+  }
+
+  /**
+   * 看门狗写入 / 清除房间告警。
+   * 同一 level + code + message 视为同一条告警，只累加 hits，不重复回调；
+   * 清除（传 null）时若存在旧告警则回调一次 cleared。
+   */
+  setRoomWarning(roomId: string, warning: RoomWarning | null, reason?: string): void {
+    const prev = this.warnings.get(roomId);
+    if (!warning) {
+      if (!prev) return;
+      this.warnings.delete(roomId);
+      this.onWarningChange?.(roomId, prev, true, reason);
+      return;
+    }
+    if (prev && prev.level === warning.level && prev.code === warning.code && prev.message === warning.message) {
+      prev.hits += 1;
+      return;
+    }
+    const next: RoomWarning = { ...warning, since: warning.since || Date.now(), hits: prev?.hits ? prev.hits + 1 : 1 };
+    this.warnings.set(roomId, next);
+    this.onWarningChange?.(roomId, next, false, reason);
   }
 
   /**
@@ -328,6 +372,7 @@ export class Collector {
     this.progress.delete(roomId);
     this.roomAccounts.delete(roomId);
     this.selfAccount.delete(roomId);
+    this.setRoomWarning(roomId, null, 'disconnected');
   }
 
   /** 彻底删除一个房间（含已停止保留的记录），房间从列表消失 */
@@ -345,12 +390,22 @@ export class Collector {
     this.roomAccounts.delete(roomId);
     this.selfAccount.delete(roomId);
     this.lastStatus.delete(roomId);
+    this.setRoomWarning(roomId, null, 'disconnected');
   }
 
   /** 全部已连接房间 + 已停止保留的房间 */
   getRooms(): RoomInfo[] {
     return [...this.sessions.keys()].map((id) => this.getRoomInfo(id)!)
       .concat([...this.saved.keys()].map((id) => this.getRoomInfo(id)!));
+  }
+
+  getLiveRoomByWebcastId(webcastRoomId: string): { roomId: string; startedAt: number } | undefined {
+    for (const session of this.sessions.values()) {
+      if (session.status === 'live' && session.webcastRoomId === webcastRoomId) {
+        return { roomId: session.roomId, startedAt: session.startedAt };
+      }
+    }
+    return undefined;
   }
 
   getRoomInfo(roomId: string): RoomInfo | null {
@@ -366,6 +421,7 @@ export class Collector {
         progress: this.progress.get(roomId),
         accountId: this.roomAccounts.get(roomId),
         selfAccount: this.selfAccount.get(roomId),
+        warning: this.warnings.get(roomId),
       };
     }
     const saved = this.saved.get(roomId);

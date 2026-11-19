@@ -67,6 +67,9 @@
   .st.stopped { background: #e8e8ee; color: #6b6b78; }
   .st.closed { background: #f3dada; color: #a33; }
   .st.error { background: #f3dada; color: #a33; }
+  .room-item .warning-badge { font-size: 10px; padding: 1px 7px; border-radius: 20px; white-space: nowrap; cursor: help; }
+  .room-item .warning-badge.warning { background: #fdf0d5; color: #a8781a; }
+  .room-item .warning-badge.error { background: #f3dada; color: #a33; }
   .card-btn { padding: 3px 10px; border: none; border-radius: 6px; font-size: 11px; cursor: pointer; font-weight: 500; background: var(--accent); color: #123; }
   .card-btn:hover { filter: brightness(0.94); }
   .card-btn.danger { background: #f5d0cc; color: #a33; }
@@ -279,6 +282,28 @@
         </details>
         <button id="aiDebugOpen" class="ghost" style="width:100%;margin-bottom:6px;">调试 AI 回复（F3）</button>
         <button id="aiSave" style="width:100%;">保存 AI 设置</button><div id="aiMsg" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
+      </div>
+      <div>
+        <div class="panel-title">礼物看门狗</div>
+        <details style="border:1px solid var(--border);border-radius:8px;padding:7px 8px;">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;">告警与自动重连设置</summary>
+          <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin:8px 0 6px;"><input id="wdEnabled" type="checkbox" />启用看门狗</label>
+          <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:6px;"><input id="wdLoginCheck" type="checkbox" />周期检查账号登录态（20003）</label>
+          <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin-bottom:6px;"><input id="wdAutoReconnect" type="checkbox" />礼物流突然中断时同账号重连一次</label>
+          <div style="display:flex;gap:6px;margin-bottom:6px;"><label style="font-size:11px;flex:1;">零礼物判定（分钟）<input id="wdQuietMin" type="number" min="1" max="240" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label><label style="font-size:11px;flex:1;">窗口内最少弹幕<input id="wdMinChats" type="number" min="0" max="1000" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label></div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;"><label style="font-size:11px;flex:1;">探测间隔（秒）<input id="wdProbeSec" type="number" min="10" max="3600" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label><label style="font-size:11px;flex:1;">失效退避上限（秒）<input id="wdProbeMaxSec" type="number" min="10" max="86400" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;" /></label></div>
+          <label style="font-size:11px;">两次自动重连冷却（秒）<input id="wdReconnectCooldown" type="number" min="60" max="86400" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:6px;margin-top:4px;" /></label>
+          <div style="font-size:10px;color:var(--muted);margin:6px 0;">弹幕活跃但长时间无礼物、或账号登录态失效时，房间卡片会显示告警。只有「此前有礼物流、之后突然归零」才会同账号重连一次；从没收到过礼物的房间只提示不重连，也不会自动换号。主播本人号会被周期性踢登录态，建议采集改用观众小号。</div>
+          <button id="wdSave" class="ghost" style="width:100%;">保存看门狗设置</button>
+          <div id="wdMsg" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
+        </details>
+        <details style="margin-top:6px;border:1px solid var(--border);border-radius:8px;padding:7px 8px;">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;">直播伴侣日志兜底</summary>
+          <label style="font-size:12px;display:flex;align-items:center;gap:6px;margin:8px 0 6px;"><input id="mateGiftEnabled" type="checkbox" />启用日志兜底</label>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px;">读取本机 Windows 抖音直播伴侣的新日志，为已连接的同一直播间补报礼物。</div>
+          <button id="mateGiftSave" class="ghost" style="width:100%;" disabled>保存日志兜底设置</button>
+          <div id="mateGiftStatus" aria-live="polite" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
+        </details>
       </div>
       <div>
         <div class="panel-title">已连接房间</div>
@@ -762,9 +787,14 @@ curl -X POST http://${base}/api/webhooks \\
               ? `<button class="card-btn" data-act="retry" data-rid="${rid}">重连</button>`
               : '';
         const accBadge = r.accountId ? `<span class="roompill" title="所属账号">${escapeHtml(r.accountName || r.accountId.slice(0, 8))}</span>` : '';
+        const warn = r.warning;
+        const warnLabel = warn ? ({ loginInvalid: '登录失效', giftSilent: '疑似收不到礼物', selfAccount: '主播本人号' }[warn.code] || '告警') : '';
+        const warnBadge = warn
+          ? `<span class="warning-badge ${warn.level}" title="${escapeHtml(warn.message)}（自 ${new Date(warn.since).toLocaleTimeString('zh-CN', { hour12: false })} 起）">${warn.level === 'error' ? '⚠ ' : ''}${escapeHtml(warnLabel)}</span>`
+          : '';
         item.innerHTML = `<div style="min-width:0;flex:1">
             <div class="r-head">${avatar}<div class="r-info"><div class="r-name">${escapeHtml(nick)} ${accBadge}</div>${meta.title ? `<div class="r-title">${escapeHtml(meta.title)}</div>` : ''}</div></div>
-            <div class="r-foot"><span class="rid">${rid}</span> · ${r.msgCount.toLocaleString()} 条消息</div>
+            <div class="r-foot"><span class="rid">${rid}</span> · ${r.msgCount.toLocaleString()} 条消息 ${warnBadge}</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;">
             <span class="st ${r.status}">${stText}</span>
@@ -876,6 +906,78 @@ curl -X POST http://${base}/api/webhooks \\
       await loadKnowledgeDocs(); await loadSuggestions(); updateAiLogConnection();
     } catch (e) { $('aiMsg').textContent = `加载 AI 配置失败：${kbErrorText(e)}`; }
   }
+  async function loadWatchdogConfig() {
+    try {
+      const c = await (await fetch('/api/watchdog')).json();
+      $('wdEnabled').checked = c.enabled !== false;
+      $('wdLoginCheck').checked = c.loginCheck !== false;
+      $('wdAutoReconnect').checked = c.autoReconnect !== false;
+      $('wdQuietMin').value = c.giftQuietMin;
+      $('wdMinChats').value = c.minChats;
+      $('wdProbeSec').value = c.probeSec;
+      $('wdProbeMaxSec').value = c.probeMaxSec;
+      $('wdReconnectCooldown').value = c.reconnectCooldownSec;
+    } catch (e) { $('wdMsg').textContent = `加载看门狗配置失败：${kbErrorText(e)}`; }
+  }
+  $('wdSave').onclick = async () => {
+    try {
+      const r = await fetch('/api/watchdog', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: $('wdEnabled').checked,
+          loginCheck: $('wdLoginCheck').checked,
+          autoReconnect: $('wdAutoReconnect').checked,
+          giftQuietMin: Number($('wdQuietMin').value),
+          minChats: Number($('wdMinChats').value),
+          probeSec: Number($('wdProbeSec').value),
+          probeMaxSec: Number($('wdProbeMaxSec').value),
+          reconnectCooldownSec: Number($('wdReconnectCooldown').value),
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok) { $('wdMsg').textContent = j.error || '保存失败'; return; }
+      $('wdMsg').textContent = '看门狗设置已保存，下一轮检查生效。';
+      await loadWatchdogConfig();
+    } catch (e) { $('wdMsg').textContent = `保存失败：${kbErrorText(e)}`; }
+  };
+  function renderMateGiftStatus(c) {
+    const status = {
+      disabled: '已关闭',
+      unsupported: '当前运行环境无法读取本机 Windows 直播伴侣日志',
+      waiting: '等待直播伴侣日志',
+      watching: '已找到日志，本次开启后已补报 ' + c.published + ' 条礼物消息',
+      error: '无法读取日志，正在重试',
+    };
+    $('mateGiftStatus').textContent = status[c.state] || '状态未知';
+  }
+  let mateGiftLoaded = false;
+  async function loadMateGiftStatus() {
+    try {
+      const response = await fetch('/api/live-companion-gifts');
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const c = await response.json();
+      if (!mateGiftLoaded) {
+        $('mateGiftEnabled').checked = c.enabled;
+        $('mateGiftSave').disabled = false;
+        mateGiftLoaded = true;
+      }
+      renderMateGiftStatus(c);
+    } catch (e) { $('mateGiftStatus').textContent = '读取状态失败：' + kbErrorText(e); }
+  }
+  $('mateGiftSave').onclick = async () => {
+    $('mateGiftSave').disabled = true;
+    try {
+      const response = await fetch('/api/live-companion-gifts', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: $('mateGiftEnabled').checked }),
+      });
+      const c = await response.json();
+      if (!response.ok) throw new Error(c.error || 'HTTP ' + response.status);
+      $('mateGiftEnabled').checked = c.enabled;
+      renderMateGiftStatus(c);
+    } catch (e) { $('mateGiftStatus').textContent = '保存失败：' + kbErrorText(e); }
+    finally { $('mateGiftSave').disabled = false; }
+  };
   const aiLogStatus = { checking: '判断中', tool: '检索中', skipped: '未回复', sent: '已回复', error: '错误', idle: '定时' };
   const seenAiLogIds = new Set();
   function appendAiLog(log) {
@@ -1157,7 +1259,7 @@ curl -X POST http://${base}/api/webhooks \\
   });
   $('roomInput').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
   document.querySelectorAll('#filters input').forEach(i => i.addEventListener('change', () => { if (ws) ws.close(); }));
-  setInterval(() => { $('stRate').textContent = (rateCounter * 60 / 30).toFixed(0); rateCounter = 0; refresh(); }, 30000);
+  setInterval(() => { $('stRate').textContent = (rateCounter * 60 / 30).toFixed(0); rateCounter = 0; refresh(); loadMateGiftStatus(); }, 30000);
   // ---- 账号管理 ----
   let accounts = [];
   let activeLoginAccountId = null; // 当前正在登录的账号 ID（登录窗口是全局单例）
@@ -1413,6 +1515,8 @@ curl -X POST http://${base}/api/webhooks \\
 
   refreshAccounts();
   loadAiConfig();
+  loadWatchdogConfig();
+  loadMateGiftStatus();
 
   connectWS();
   refresh();

@@ -152,6 +152,7 @@ curl -X POST http://localhost:8757/api/rooms/connect \
 | `DYHUB_CHAT_INTERVAL_MS` | `POST /api/rooms/:roomId/chat` 同一房间两条弹幕的最小间隔（毫秒） | `3000` |
 | `DYHUB_AI_REPLY_INTERVAL_MS` | AI 同时回复多个观众时，相邻两条回复的间隔默认值（毫秒；控制台保存的「多条回复间隔」优先） | `3000` |
 | `DYHUB_KNOWLEDGE_DIR` | AI 知识库目录的默认值（支持绝对路径 / 相对运行目录；控制台保存的目录优先）→ 详见 [知识库配置指南](docs/knowledge-guide.md) | `data/knowledge` |
+| `DYHUB_WATCHDOG` | 设为 `off` / `0` / `false` 关闭礼物看门狗 ticker（控制台「礼物看门狗」配置面板仍可用） | 开启 |
 
 ---
 
@@ -197,6 +198,7 @@ curl -X POST http://localhost:8757/api/rooms/connect \
 | `follow` | 关注 | `action` |
 | `room` | 直播间统计 | `total`（在线）/ `popularity` / `totalUser` |
 | `roomStatus` | 房间状态变更 | `status`（connecting/live/closed/error/stopped）/ `message`（错误信息） |
+| `roomWarning` | 房间告警（登录失效 / 疑似收不到礼物） | `level`（warning/error）/ `code`（loginInvalid/giftSilent/selfAccount）/ `message` / `since` / `cleared`（恢复）/ `reason` |
 | `unknown` | 未识别消息透传 | `method` |
 
 > **表情**：`content` 是原始文本，常见表情是 `[比心]` 这样的方括号占位符。抖音下发富文本时（粉丝团 / 会员表情、@某人），`parts` 按顺序给出每一段：`{ "type": "text", "text" }`、`{ "type": "emote", "url", "name" }` 或 `{ "type": "mention", "text": "@昵称", "userId" }`，渲染时优先用 `parts`；纯表情弹幕的 `content` 可能为空。整条消息是一张大表情（`WebcastEmojiChatMessage`）时同样以 `chat` 下发，`sticker: true`，`parts` 只有那一张图，`content` 为抖音给的文字替代。表情图在抖音 CDN 上，`<img>` 需加 `referrerpolicy="no-referrer"`。
@@ -244,6 +246,18 @@ curl -X POST http://localhost:8757/api/webhooks \
 **通用参数**（WS / SSE）：`roomId`（选填，订阅指定房间，缺省全部）、`types`（选填，逗号分隔的事件类型过滤）。
 
 > **房间状态感知**：订阅 `types=roomStatus`（或与其他类型混合，如 `types=chat,gift,roomStatus`）可接收房间状态变更事件。当房间进入 `connecting` / `live` / `closed` / `error` / `stopped` 状态时，中台会推送一条 `type: "roomStatus"` 事件，消费端可据此感知主播下播、连接失败等状态变化，无需轮询管理 API。
+
+> **房间告警**：订阅 `types=roomWarning` 可接收礼物看门狗告警。账号登录态失效（20003）或「弹幕活跃但长时间零礼物」时推送，`cleared: true` 表示已恢复；控制台房间卡片也会显示对应徽标。配置在控制台「礼物看门狗」面板 / `data/watchdog.json`。
+
+看门狗还会自动重连：曾经收到过礼物流、之后突然归零时，用**同一账号**重建会话（冷却 `reconnectCooldownSec`，默认 30 分钟）；曾经 `live` 过的采集会话掉线（`closed` / `error`）超过 30 秒也会自动拉起，连续失败 3 次后停手（通常是主播已下播）。重连不会自动换号。
+
+### 直播伴侣日志兜底
+
+控制台「礼物看门狗 → 直播伴侣日志兜底」默认关闭。勾选后保存即可生效，设置保存在 `data/live-companion-gifts.json`，与看门狗开关独立。
+
+在 Windows 上，DyHub 读取运行账号的 `%APPDATA%\webcast_mate\matex\logs`，只处理开启后、与已连接直播间的内部房间号一致的新礼物消息。补报事件沿原有 WS、SSE、Webhook 分发，带有 `source: "liveCompanionLog"`，与网页采集按抖音消息 ID 去重。新旧判断用日志行自己的本机时间，不依赖本机时钟与抖音服务器是否一致；重启服务、重新启用或切换房间时不会补发历史礼物。
+
+该功能依赖抖音直播伴侣内部日志的格式和写入频率。直播伴侣升级、停止写入或写入延迟都可能导致漏报。直接在 Windows 主播电脑上用同一个系统账号运行 DyHub 和直播伴侣。本功能只支持已验证格式的抖音直播伴侣日志。
 
 ---
 

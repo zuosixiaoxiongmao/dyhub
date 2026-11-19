@@ -18,6 +18,7 @@ export interface LiveSessionOptions {
   onError?: (err: Error) => void;
   /** 页面播放器最近请求的直播流地址（由 BrowserManager.openRoom 在打开页面前开始记录） */
   streamUrl?: () => string | null;
+  webcastRoomId?: () => string | undefined;
 }
 
 export type LiveSessionStatus = 'connecting' | 'live' | 'closed';
@@ -44,6 +45,10 @@ export class LiveSession {
   readonly roomId: string;
   readonly startedAt: number = Date.now();
   status: LiveSessionStatus = 'connecting';
+
+  get webcastRoomId(): string | undefined {
+    return this.opts.webcastRoomId?.();
+  }
 
   private page: Page;
   private cdp: CDPSession;

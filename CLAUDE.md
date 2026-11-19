@@ -57,7 +57,11 @@ docker compose up -d --build   # 一键启动（内置 Chromium + 中文字体�
   - `agent.ts` — 轻量 Agent 工作流：OpenAI 兼容 `tools` / `tool_calls` 循环，最多 `maxRounds` 轮，支持一次调用多个工具与轮数上限收敛。**新增工具只需实现 `AgentTool` 接口并注册**，不改循环。
   - `knowledgeBase.ts` — 文档知识库。读取配置目录（`AiConfig.knowledgeDir`，默认 `data/knowledge`，支持绝对/相对路径，可用 `DYHUB_KNOWLEDGE_DIR` 改默认值）下的 `*.md|*.txt`，按 Markdown 标题 / 段落切块（700 字、100 字重叠），用中文二元词 + BM25 简化算法本地检索。`KnowledgeRetriever` / `KnowledgeDocumentStore` 是替换为向量库或远程知识服务的扩展点。目录规则、文档写法与排障见 `docs/knowledge-guide.md`。
   - `suggestionStore.ts` — 游戏改进建议 / BUG 库（`data/ai-suggestions.json`）。Agent 识别出弹幕里对游戏的具体改进建议或 BUG 反馈（报错、卡顿、闪退等）时调用 `record_suggestion` 工具写入，按房间隔离，同房间 7 天内相同内容去重，最多保留 2000 条。控制台「游戏改进建议 / BUG」面板与 `GET/DELETE /api/ai-chat/suggestions` 可查看 / 删除，`AiConfig.suggestionEnabled`（默认开启）控制是否注册该工具；调试面板的模拟弹幕不写入。
-- **`src/api/server.ts`** — Fastify 管理 API（控制面）。房间管理、Webhook 管理、统计、SSE 路由注册、AI 配置 / 知识库 / 改进建议与 BUG CRUD、控制台静态资源。`normalizeRoomIdInput` 兼容全角数字 / 直播间 URL / 噪声输入。
+- **`src/monitor/`** — 礼物 / 登录态看门狗（配置在 `data/watchdog.json`，控制台面板管理）。
+  - `watchdog.ts` — 每 10s 检查 `live` 房间：① 按 `probeSec` 用账号 cookie 探测 `webcast/user/me`，抖音明确返回 20003 时写 `RoomInfo.warning`（error / `loginInvalid`）；② 统计非空弹幕与礼物流量，弹幕活跃但 `giftQuietMin` 分钟无礼物时告警（本会话曾收到中文礼物名 → error，否则 warning）；③ 仅「本会话曾有礼物流、之后突然归零」的强证据（error 级）+ 未明确失效时同账号重连（冷却 `reconnectCooldownSec`；主播本人号也用同一账号重连，**不自动换号**——换号会改变 AI 发言身份）；从没收到过礼物的房间只提示不重连；④ 会话级自愈：曾经 `live` 过的房间进入 `closed` / `error` 持续 30s 后同账号重连，连续失败 3 次停止（通常是主播下播）。告警经 `Collector.setRoomWarning()` 写入，随 `/api/rooms`、`/api/stats` 返回；变更由 `onWarningChange` 发布 `roomWarning` 事件（`cleared: true` 表示恢复），WS/SSE/Webhook 自动支持。主播本人号的 `selfAccount` 也会以 warning 提示。
+  - `liveCompanionGifts.ts` — 直播伴侣日志兜底（默认关闭，`data/live-companion-gifts.json`）。读 `%APPDATA%\webcast_mate\matex\logs` 下的 `WebcastGiftMessage` 行（日志里没有弹幕，只能兜底礼物），解析出 `source: 'liveCompanionLog'` 的礼物事件走同一管道，与网页采集按 msgId 去重。**新鲜度必须用日志行自己的本地时间**（`LINE_TS`）判断，不能用消息里的服务器 `createTime` 对比 `Date.now()`——本机时钟偏差几十秒就会把正常礼物全部当成「未来消息」丢弃。启用时旧文件跳到末尾、当前文件只回看末尾 512KB，避免重读历史。
+  - `watchdogConfig.ts` — `data/watchdog.json` 读写与校验，`GET/PUT /api/watchdog` 管理；`DYHUB_WATCHDOG=off` 为应急总开关。
+- **`src/api/server.ts`** — Fastify 管理 API（控制面）。房间管理、Webhook 管理、统计、SSE 路由注册、AI 配置 / 知识库 / 改进建议与 BUG CRUD、看门狗配置、控制台静态资源。`normalizeRoomIdInput` 兼容全角数字 / 直播间 URL / 噪声输入。
 - **`src/ui/dashboard.html`** — 控制台单页应用（纯 HTML，无框架）。
 
 ### 关键设计决策
@@ -84,6 +88,7 @@ docker compose up -d --build   # 一键启动（内置 Chromium + 中文字体�
 | `DYHUB_CHAT_INTERVAL_MS` | 同房间两条弹幕发送的最小间隔（防风控） | `3000` |
 | `DYHUB_AI_REPLY_INTERVAL_MS` | AI 同时回复多个观众时，相邻两条回复的间隔默认值（控制台 `replyIntervalMs` 优先） | `3000` |
 | `DYHUB_KNOWLEDGE_DIR` | AI 知识库目录默认值（绝对路径或相对运行目录；控制台 `knowledgeDir` 优先） | `data/knowledge` |
+| `DYHUB_WATCHDOG` | `off`/`0`/`false` 关闭礼物看门狗 ticker（配置面板仍可用） | 开启 |
 
 ### 扩展点
 

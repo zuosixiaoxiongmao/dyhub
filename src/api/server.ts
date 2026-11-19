@@ -16,6 +16,8 @@ import { EventBus } from '../pipeline/eventBus.js';
 import { WebhookDispatcher } from '../dispatch/webhook.js';
 import { registerSseRoute } from '../dispatch/sseServer.js';
 import type { ChatAssistant } from '../ai/chatAssistant.js';
+import type { WatchdogConfigStore } from '../monitor/watchdogConfig.js';
+import type { LiveCompanionGifts } from '../monitor/liveCompanionGifts.js';
 import { WebSocketServer, WebSocket } from 'ws';
 
 /**
@@ -44,6 +46,8 @@ export interface ApiDeps {
   webhookDispatcher: WebhookDispatcher;
   startedAt: number;
   aiAssistant: ChatAssistant;
+  watchdogConfig: WatchdogConfigStore;
+  liveCompanionGifts: LiveCompanionGifts;
 }
 
 export function buildApi(deps: ApiDeps): FastifyInstance {
@@ -55,6 +59,28 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       reply.header('Cache-Control', 'no-cache, no-store, must-revalidate');
     }
     return payload;
+  });
+
+  // ---- 礼物 / 登录态看门狗配置 ----
+  app.get('/api/watchdog', async () => deps.watchdogConfig.get());
+  app.put('/api/watchdog', async (req, reply) => {
+    try {
+      return { ok: true, config: deps.watchdogConfig.update((req.body ?? {}) as Record<string, unknown>) };
+    } catch (e) {
+      return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
+  app.get('/api/live-companion-gifts', async () => deps.liveCompanionGifts.getStatus());
+  app.put('/api/live-companion-gifts', async (req, reply) => {
+    const enabled = (req.body as { enabled?: unknown } | null | undefined)?.enabled;
+    if (typeof enabled !== 'boolean') return reply.code(400).send({ error: 'enabled 必须是布尔值' });
+    try {
+      return deps.liveCompanionGifts.update(enabled);
+    } catch (error) {
+      app.log.error(error);
+      return reply.code(500).send({ error: '保存日志兜底设置失败' });
+    }
   });
 
   app.get('/api/ai-chat', async () => deps.aiAssistant.getConfig());
@@ -367,6 +393,8 @@ export function buildApi(deps: ApiDeps): FastifyInstance {
       meta: r.meta ?? null,
       accountId: r.accountId,
       accountName: r.accountId ? accountStore.getAccount(r.accountId)?.name : undefined,
+      selfAccount: r.selfAccount,
+      warning: r.warning ?? null,
     })),
   }));
 

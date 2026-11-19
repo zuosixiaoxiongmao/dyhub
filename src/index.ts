@@ -18,6 +18,10 @@ import { WsDispatcher } from './dispatch/wsServer.js';
 import { WebhookDispatcher } from './dispatch/webhook.js';
 import { buildApi } from './api/server.js';
 import { ChatAssistant } from './ai/chatAssistant.js';
+import { Watchdog } from './monitor/watchdog.js';
+import { WatchdogConfigStore } from './monitor/watchdogConfig.js';
+import { LiveCompanionGifts } from './monitor/liveCompanionGifts.js';
+import type { DanmakuEvent, RoomWarning } from './types/events.js';
 
 const PORT = Number(process.env.DYHUB_PORT ?? 8757);
 const HOST = process.env.DYHUB_HOST ?? '0.0.0.0';
@@ -27,6 +31,11 @@ async function main() {
   // 1. 事件管道
   const bus = new EventBus();
   const dedupe = new EventDeduplicator(200_000);
+  const publish = (event: DanmakuEvent): boolean => {
+    if (dedupe.isDuplicate(event.id)) return false;
+    bus.publish(event);
+    return true;
+  };
 
   // 2. 采集内核
   // DYHUB_COLLECTOR=browser（默认）：真实浏览器 + CDP 帧截获，最稳、抗风控（需系统 Chrome/Chromium）
@@ -49,6 +58,26 @@ async function main() {
     });
   };
 
+  // 看门狗告警变更 → 发布 RoomWarningEvent（同样每次唯一 id，不经 dedupe）
+  const onWarningChange = (roomId: string, warning: RoomWarning, cleared: boolean, reason?: string) => {
+    bus.publish({
+      id: `rw_${roomId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      roomId,
+      platform: 'douyin',
+      type: 'roomWarning',
+      ts: Date.now(),
+      receivedAt: Date.now(),
+      data: {
+        level: warning.level,
+        code: warning.code,
+        message: warning.message,
+        since: warning.since,
+        cleared: cleared || undefined,
+        reason,
+      },
+    });
+  };
+
   if (kernel === 'lightweight') {
     const { LightweightSession } = await import('./collector/lightweightSession.js');
     collector = new Collector({
@@ -56,15 +85,14 @@ async function main() {
         new LightweightSession(roomId, {
           onMessage: (msg, meta) => {
             const ev = normalize(msg, meta);
-            if (!ev) return;
-            if (dedupe.isDuplicate(ev.id)) return;
-            bus.publish(ev);
+            if (ev) publish(ev);
           },
           onError: (err) => console.error(`[dyhub] 房间 ${roomId} 采集错误:`, err.message),
           cookie,
         }),
       onMessage: () => {},
       onStatusChange,
+      onWarningChange,
     });
     console.log('[dyhub] 采集内核: lightweight（纯代码直连，连接快 / 低资源）');
   } else {
@@ -81,11 +109,10 @@ async function main() {
       browser,
       onMessage: (msg, meta) => {
         const ev = normalize(msg, meta);
-        if (!ev) return;
-        if (dedupe.isDuplicate(ev.id)) return;
-        bus.publish(ev);
+        if (ev) publish(ev);
       },
       onStatusChange,
+      onWarningChange,
     });
   }
 
@@ -93,7 +120,14 @@ async function main() {
   const webhooks = new WebhookDispatcher(bus);
   const aiAssistant = new ChatAssistant(bus, collector);
 
-  // 4. 管理 API（WS 分发器复用 Fastify 的 HTTP server，先建 app 再绑 ws）
+  // 4. 礼物 / 登录态看门狗（配置在 data/watchdog.json，控制台可调）
+  const watchdogConfig = new WatchdogConfigStore();
+  const watchdog = new Watchdog({ bus, collector, config: watchdogConfig });
+  const liveCompanionGifts = new LiveCompanionGifts(collector, publish);
+  // 应急总开关：DYHUB_WATCHDOG=off / 0 / false 时不启动 ticker（配置面板仍可用）
+  const watchdogDisabled = ['off', '0', 'false'].includes((process.env.DYHUB_WATCHDOG ?? '').trim().toLowerCase());
+
+  // 5. 管理 API（WS 分发器复用 Fastify 的 HTTP server，先建 app 再绑 ws）
   let wsDispatcher: WsDispatcher | null = null;
   const app = buildApi({
     collector,
@@ -102,18 +136,28 @@ async function main() {
     webhookDispatcher: webhooks,
     startedAt,
     aiAssistant,
+    watchdogConfig,
+    liveCompanionGifts,
   });
   wsDispatcher = new WsDispatcher(app.server, bus, collector);
 
+  liveCompanionGifts.start();
   await app.listen({ port: PORT, host: HOST });
   console.log(`[dyhub] 管理台就绪: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
   console.log(`[dyhub] WS 事件流: ws://localhost:${PORT}/ws?roomId=xxx&types=chat,gift`);
   console.log(`[dyhub] SSE 事件流: http://localhost:${PORT}/api/events?types=chat,gift`);
   console.log(`[dyhub] 连接直播间示例: curl -X POST http://localhost:${PORT}/api/rooms/connect -d '{"roomId":"708764876300"}'`);
+  if (watchdogDisabled) console.log('[dyhub] 看门狗已通过 DYHUB_WATCHDOG 关闭');
+  else {
+    watchdog.start();
+    console.log(`[dyhub] 礼物看门狗已启动（零礼物判定 ${watchdogConfig.get().giftQuietMin} 分钟）`);
+  }
 
-  // 5. 优雅退出
+  // 6. 优雅退出
   const shutdown = async () => {
     console.log('\n[dyhub] 正在关闭...');
+    watchdog.stop();
+    liveCompanionGifts.stop();
     await collector.disconnectAll();
     wsDispatcher?.close();
     webhooks.close();

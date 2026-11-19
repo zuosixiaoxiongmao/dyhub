@@ -187,6 +187,7 @@ export class LightweightSession {
   readonly roomId: string;
   readonly startedAt = Date.now();
   status: 'connecting' | 'live' | 'closed' | 'error' = 'connecting';
+  webcastRoomId?: string;
 
   private ws: WebSocket | null = null;
   private hbTimer: ReturnType<typeof setInterval> | null = null;
@@ -375,6 +376,7 @@ export class LightweightSession {
     const { getSign } = loadSignApi();
     await this.initCookies();
     const roomId = await this.resolveRoomId();
+    this.webcastRoomId = roomId;
 
     const sigParams =
       `live_id=1,aid=6383,version_code=180800,webcast_sdk_version=1.0.14-beta.0,room_id=${roomId},` +

@@ -23,6 +23,7 @@ export type DanmakuEventType =
   | 'follow'    // 关注
   | 'room'        // 房间统计（在线人数等）
   | 'roomStatus'  // 房间状态变更（connecting/live/closed/error/stopped）
+  | 'roomWarning' // 房间告警（登录失效 / 疑似收不到礼物）
   | 'unknown';    // 尚未标准化的原始消息（透传）
 
 /** 直播间用户（标准化） */
@@ -74,6 +75,7 @@ export interface ChatEvent extends BaseDanmakuEvent {
 
 export interface GiftEvent extends BaseDanmakuEvent {
   type: 'gift';
+  source?: 'liveCompanionLog';
   data: {
     giftId: string;
     giftName: string;
@@ -121,6 +123,38 @@ export interface RoomStatusEvent extends BaseDanmakuEvent {
   };
 }
 
+/** 看门狗告警级别 */
+export type WatchLevel = 'warning' | 'error';
+
+/** 看门狗告警类型 */
+export type WatchCode = 'giftSilent' | 'loginInvalid' | 'selfAccount';
+
+/** 房间告警（写入 RoomInfo.warning，供控制台与外部消费端展示） */
+export interface RoomWarning {
+  level: WatchLevel;
+  code: WatchCode;
+  message: string;
+  /** 首次触发时间（毫秒） */
+  since: number;
+  /** 同一告警累计触发次数（状态不变时只累加，不重复发事件） */
+  hits: number;
+}
+
+/** 房间告警事件 —— 看门狗写入 / 清除告警时发布 */
+export interface RoomWarningEvent extends BaseDanmakuEvent {
+  type: 'roomWarning';
+  data: {
+    level: WatchLevel;
+    code: WatchCode;
+    message: string;
+    since: number;
+    /** true = 告警已恢复（消费端据此解除告警） */
+    cleared?: boolean;
+    /** 恢复原因：gift-started | login-valid | disconnected */
+    reason?: string;
+  };
+}
+
 export interface UnknownEvent extends BaseDanmakuEvent {
   type: 'unknown';
   data: { method: string; payloadBase64?: string };
@@ -135,6 +169,7 @@ export type DanmakuEvent =
   | FollowEvent
   | RoomEvent
   | RoomStatusEvent
+  | RoomWarningEvent
   | UnknownEvent;
 
 /** 事件订阅过滤器：可订阅全部，或按 roomId / type 过滤 */

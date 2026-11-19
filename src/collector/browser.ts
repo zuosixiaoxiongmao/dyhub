@@ -68,6 +68,8 @@ export interface OpenedRoom {
   context?: BrowserContext;
   /** 播放器最近请求的直播流地址（FLV / HLS），还没请求时为 null */
   streamUrl: () => string | null;
+  /** 内部 webcast 房间号，来自直播间推送连接 */
+  webcastRoomId: () => string | undefined;
 }
 
 /** 播放器拉流的地址：FLV 或 HLS */
@@ -183,6 +185,15 @@ export class BrowserManager {
     const cdp = await ctx.newCDPSession(page);
     await cdp.send('Network.enable');
 
+    let webcastRoomId: string | undefined;
+    cdp.on('Network.webSocketCreated', ({ url }) => {
+      if (!URL.canParse(url)) return;
+      const wsUrl = new URL(url);
+      if (!wsUrl.hostname.endsWith('.douyin.com') || !wsUrl.pathname.startsWith('/webcast/im/push/')) return;
+      const id = wsUrl.searchParams.get('room_id');
+      if (id && /^[1-9]\d*$/.test(id)) webcastRoomId = id;
+    });
+
     // 在打开页面前开始记录直播流地址，两个来源：
     //  - 播放器的拉流请求：最准，但直播流的 fetch 永远不结束，不进 performance 资源记录，事后补不回来；
     //    且登录态下播放器在 Web Worker 里拉流，页面看不到这条请求。
@@ -218,7 +229,11 @@ export class BrowserManager {
         /* 点击失败不阻塞 */
       }
     }
-    return { page, cdp, context: ownContext ? ctx : undefined, streamUrl: () => requested ?? entered };
+    return {
+      page, cdp, context: ownContext ? ctx : undefined,
+      streamUrl: () => requested ?? entered,
+      webcastRoomId: () => webcastRoomId,
+    };
   }
 
   async closeRoom(page: Page, context?: BrowserContext): Promise<void> {

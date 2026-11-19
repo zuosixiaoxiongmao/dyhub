@@ -13,7 +13,7 @@ import type {
   GiftEvent,
   ChatEvent,
 } from '../types/events.js';
-import { decodeMessageBody, longToStr, type RawProtoMessage } from '../proto/douyin.proto.js';
+import { decodeMessageBody, longToStr, type DecodedMessage, type RawProtoMessage } from '../proto/douyin.proto.js';
 
 function toUser(body: any): DanmakuUser | undefined {
   const u = body?.user;
@@ -153,15 +153,19 @@ export function normalize(msg: RawProtoMessage, meta: { roomId: string }): Danma
     } satisfies DanmakuEvent;
   }
 
+  return normalizeDecoded(decoded, meta);
+}
+
+export function normalizeDecoded(decoded: DecodedMessage, meta: { roomId: string }): DanmakuEvent | null {
   const body = decoded.body;
   const base = {
-    id: msg.msgId || decoded.msgId,
+    id: decoded.msgId,
     roomId: meta.roomId,
     platform: 'douyin' as const,
     ts: createTime(body),
     receivedAt: Date.now(),
     user: toUser(body),
-    rawMethod: msg.method,
+    rawMethod: decoded.method,
   };
 
   switch (decoded.method) {
